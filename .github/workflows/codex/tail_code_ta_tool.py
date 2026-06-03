@@ -1,0 +1,1244 @@
+"""Tail / code chain TA tool for Maya 2026.
+
+Run in Maya Script Editor:
+
+    import tail_code_ta_tool
+    tail_code_ta_tool.show()
+
+The implementation is intentionally self-contained so it can be dropped into a
+Maya scripts folder or loaded directly from the Script Editor.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import traceback
+from dataclasses import dataclass, field
+
+
+try:
+    from maya import cmds
+    from maya.api import OpenMaya as om
+    from maya import OpenMayaUI as omui
+except Exception:  # Allows syntax checks outside Maya.
+    cmds = None
+    om = None
+    omui = None
+
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+    import shiboken6
+except Exception:
+    try:
+        from PySide2 import QtCore, QtGui, QtWidgets
+        import shiboken2 as shiboken6
+    except Exception:
+        QtCore = QtGui = QtWidgets = shiboken6 = None
+
+
+WINDOW_OBJECT_NAME = "tailCodeTAToolWindow"
+DATA_NODE = "tailCodeTATool_sceneData"
+DATA_ATTR = "chainsJson"
+DISPLAY_GROUP = "tailCodeTATool_display_GRP"
+TWEAKER_GROUP = "TailTweaker_GRP"
+TWEAKER_PREFIX = "TailTweaker_"
+
+
+COLORS = [
+    (0.22, 0.70, 0.95),
+    (0.95, 0.45, 0.18),
+    (0.60, 0.82, 0.25),
+    (0.78, 0.45, 0.92),
+    (0.98, 0.76, 0.20),
+    (0.25, 0.85, 0.72),
+]
+
+
+def _require_maya():
+    if cmds is None or om is None:
+        raise RuntimeError("This tool must be run inside Maya.")
+
+
+def _safe_name(text):
+    cleaned = []
+    for ch in text:
+        if ch.isalnum() or ch == "_":
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+    return "".join(cleaned).strip("_") or "chain"
+
+
+def _maya_main_window():
+    if omui is None or QtWidgets is None:
+        return None
+    ptr = omui.MQtUtil.mainWindow()
+    if ptr is None:
+        return None
+    return shiboken6.wrapInstance(int(ptr), QtWidgets.QWidget)
+
+
+def _ensure_data_node():
+    _require_maya()
+    if not cmds.objExists(DATA_NODE):
+        cmds.createNode("network", name=DATA_NODE)
+    if not cmds.attributeQuery(DATA_ATTR, node=DATA_NODE, exists=True):
+        cmds.addAttr(DATA_NODE, longName=DATA_ATTR, dataType="string")
+    return DATA_NODE
+
+
+def _joint_exists(name):
+    return bool(cmds and name and cmds.objExists(name) and cmds.nodeType(name) == "joint")
+
+
+def _world_position(joint):
+    return tuple(float(v) for v in cmds.xform(joint, query=True, worldSpace=True, translation=True))
+
+
+def _rotate_values(joint):
+    values = cmds.getAttr(joint + ".rotate")[0]
+    return tuple(float(v) for v in values)
+
+
+def _joint_orient_values(joint):
+    if not cmds.objExists(joint + ".jointOrient"):
+        return (0.0, 0.0, 0.0)
+    values = cmds.getAttr(joint + ".jointOrient")[0]
+    return tuple(float(v) for v in values)
+
+
+def _dist(a, b):
+    return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _length(v):
+    return math.sqrt(_dot(v, v))
+
+
+def _angle_degrees(a, b):
+    la = _length(a)
+    lb = _length(b)
+    if la <= 1e-8 or lb <= 1e-8:
+        return 0.0
+    c = max(-1.0, min(1.0, _dot(a, b) / (la * lb)))
+    return math.degrees(math.acos(c))
+
+
+def _dag_path(node):
+    paths = cmds.ls(node, long=True) or []
+    return paths[0] if paths else node
+
+
+def _add_string_attr(node, attr, value):
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        cmds.addAttr(node, longName=attr, dataType="string")
+    cmds.setAttr("%s.%s" % (node, attr), value, type="string")
+
+
+def _add_bool_attr(node, attr, value=True):
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        cmds.addAttr(node, longName=attr, attributeType="bool")
+    cmds.setAttr("%s.%s" % (node, attr), bool(value))
+
+
+def _get_string_attr(node, attr, default=""):
+    if not cmds.objExists(node) or not cmds.attributeQuery(attr, node=node, exists=True):
+        return default
+    return cmds.getAttr("%s.%s" % (node, attr)) or default
+
+
+def _is_tweaker(node):
+    return bool(cmds.objExists(node) and cmds.attributeQuery("tailTweaker", node=node, exists=True) and cmds.getAttr(node + ".tailTweaker"))
+
+
+def _find_orient_constraint_driving(node):
+    constraints = []
+    for axis in "XYZ":
+        attr = "%s.rotate%s" % (node, axis)
+        if not cmds.objExists(attr):
+            continue
+        found = cmds.listConnections(attr, source=True, destination=False, type="orientConstraint") or []
+        for constraint in found:
+            if constraint not in constraints:
+                constraints.append(constraint)
+    return constraints[0] if constraints else None
+
+
+def _attr_has_incoming_connection(attr):
+    return bool(cmds.objExists(attr) and (cmds.listConnections(attr, source=True, destination=False) or []))
+
+
+def _incoming_plug(attr):
+    plugs = cmds.listConnections(attr, source=True, destination=False, plugs=True) or []
+    return plugs[0] if plugs else ""
+
+
+def sort_root_to_tip(joints):
+    """Sort selected joints into root-to-tip order while preserving intent.
+
+    If the joints are in one DAG chain, depth sorting gives root to tip. For
+    mixed or partial selections, the user selection order is kept.
+    """
+    _require_maya()
+    valid = []
+    for joint in joints:
+        if _joint_exists(joint) and joint not in valid:
+            valid.append(joint)
+    if len(valid) < 2:
+        return valid
+
+    long_paths = {j: _dag_path(j) for j in valid}
+    depths = {j: long_paths[j].count("|") for j in valid}
+    sorted_by_depth = sorted(valid, key=lambda j: depths[j])
+
+    chain_ok = True
+    for parent, child in zip(sorted_by_depth, sorted_by_depth[1:]):
+        parent_path = long_paths[parent] + "|"
+        if not long_paths[child].startswith(parent_path):
+            chain_ok = False
+            break
+    return sorted_by_depth if chain_ok else valid
+
+
+@dataclass
+class ChainData:
+    label: str
+    joints: list[str]
+    threshold: float = 15.0
+    visible: bool = True
+    color_index: int = 0
+    last_score: float = 0.0
+    problem_joints: list[str] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "label": self.label,
+            "joints": self.joints,
+            "threshold": self.threshold,
+            "visible": self.visible,
+            "color_index": self.color_index,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            label=str(data.get("label") or "chain"),
+            joints=[str(j) for j in data.get("joints", []) if j],
+            threshold=float(data.get("threshold", 15.0)),
+            visible=bool(data.get("visible", True)),
+            color_index=int(data.get("color_index", 0)),
+        )
+
+
+class JointAngleAnalyzer:
+    @staticmethod
+    def evaluate(joints, threshold):
+        valid = [j for j in joints if _joint_exists(j)]
+        positions = [_world_position(j) for j in valid]
+        rows = []
+
+        for index, joint in enumerate(valid):
+            rotate = _rotate_values(joint)
+            orient = _joint_orient_values(joint)
+            rows.append(
+                {
+                    "joint": joint,
+                    "rotate": rotate,
+                    "joint_orient": orient,
+                    "bend": 0.0,
+                    "delta": (0.0, 0.0, 0.0),
+                    "max_delta": 0.0,
+                }
+            )
+
+        for i in range(1, len(positions) - 1):
+            before = _sub(positions[i - 1], positions[i])
+            after = _sub(positions[i + 1], positions[i])
+            angle = _angle_degrees(before, after)
+            rows[i]["bend"] = abs(180.0 - angle)
+
+        axis_deltas = []
+        problem_joints = []
+        for i in range(1, len(rows)):
+            prev_rotate = rows[i - 1]["rotate"]
+            rotate = rows[i]["rotate"]
+            delta = tuple(abs(rotate[axis] - prev_rotate[axis]) for axis in range(3))
+            max_delta = max(delta)
+            rows[i]["delta"] = delta
+            rows[i]["max_delta"] = max_delta
+            axis_deltas.append(delta)
+
+        bend_values = [row["bend"] for row in rows]
+        bend_deltas = []
+        for i in range(1, len(rows)):
+            delta = abs(rows[i]["bend"] - rows[i - 1]["bend"])
+            bend_deltas.append(delta)
+            if rows[i]["bend"] > threshold:
+                problem_joints.append(rows[i]["joint"])
+
+        score = sum(max(0.0, bend - threshold) for bend in bend_values)
+        return {
+            "score": score,
+            "angle_rows": rows,
+            "axis_deltas": axis_deltas,
+            "max_deltas": [row["max_delta"] for row in rows],
+            "bend_values": bend_values,
+            "bend_deltas": bend_deltas,
+            "problem_joints": problem_joints,
+            "positions": positions,
+        }
+
+
+CurvatureAnalyzer = JointAngleAnalyzer
+
+
+class HeatMapWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.values = []
+        self.threshold = 15.0
+        self.setMinimumHeight(52)
+
+    def set_values(self, values, threshold):
+        self.values = list(values)
+        self.threshold = max(float(threshold), 0.001)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor(36, 38, 42))
+        if not self.values:
+            painter.setPen(QtGui.QColor(150, 150, 150))
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "曲がりデータなし")
+            return
+
+        count = len(self.values)
+        width = max(1, self.width() / float(count))
+        for i, value in enumerate(self.values):
+            ratio = max(0.0, min(1.0, value / self.threshold))
+            r = int(70 + ratio * 185)
+            g = int(210 - ratio * 155)
+            b = 70
+            painter.fillRect(QtCore.QRectF(i * width, 0, width + 1, self.height()), QtGui.QColor(r, g, b))
+
+
+class BendGraphWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows = []
+        self.threshold = 15.0
+        self.setMinimumHeight(210)
+
+    def set_angle_rows(self, rows, threshold):
+        self.rows = list(rows)
+        self.threshold = float(threshold)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QtGui.QColor(28, 30, 34))
+        margin_left = 44
+        margin_top = 18
+        margin_right = 18
+        margin_bottom = 34
+        plot = rect.adjusted(margin_left, margin_top, -margin_right, -margin_bottom)
+        painter.setPen(QtGui.QColor(86, 90, 98))
+        painter.drawRect(plot)
+
+        if not self.rows:
+            painter.setPen(QtGui.QColor(155, 155, 155))
+            painter.drawText(rect, QtCore.Qt.AlignCenter, "曲がりグラフ")
+            return
+
+        values = [row["bend"] for row in self.rows]
+        max_value = max(values + [self.threshold, 1.0])
+        max_value = math.ceil(max_value / 10.0) * 10.0
+
+        def point(index, value):
+            x = plot.left() + (index / max(1, len(self.rows) - 1)) * plot.width()
+            y = plot.bottom() - (value / max_value) * plot.height()
+            return QtCore.QPointF(x, y)
+
+        threshold_y = plot.bottom() - (self.threshold / max_value) * plot.height()
+        painter.setPen(QtGui.QPen(QtGui.QColor(210, 80, 70), 1, QtCore.Qt.DashLine))
+        painter.drawLine(QtCore.QPointF(plot.left(), threshold_y), QtCore.QPointF(plot.right(), threshold_y))
+
+        path = QtGui.QPainterPath()
+        for index, value in enumerate(values):
+            p = point(index, value)
+            if index == 0:
+                path.moveTo(p)
+            else:
+                path.lineTo(p)
+        painter.setPen(QtGui.QPen(QtGui.QColor(245, 190, 75), 2))
+        painter.drawPath(path)
+
+        for index, row in enumerate(self.rows):
+            value = row["bend"]
+            p = point(index, value)
+            if value > self.threshold:
+                painter.setBrush(QtGui.QColor(225, 70, 60))
+                painter.setPen(QtGui.QColor(225, 70, 60))
+                painter.drawEllipse(p, 5, 5)
+            else:
+                painter.setBrush(QtGui.QColor(245, 190, 75))
+                painter.setPen(QtGui.QColor(245, 190, 75))
+                painter.drawEllipse(p, 3, 3)
+
+        painter.setPen(QtGui.QColor(210, 212, 216))
+        painter.drawText(QtCore.QPointF(plot.left(), rect.bottom() - 13), "曲がり")
+        painter.setPen(QtGui.QColor(225, 90, 80))
+        painter.drawText(QtCore.QPointF(plot.left() + 58, rect.bottom() - 13), "しきい値超え")
+
+        painter.setPen(QtGui.QColor(170, 174, 182))
+        painter.drawText(QtCore.QPointF(8, plot.top() + 10), "%.0f" % max_value)
+        painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
+
+
+class ScoreGraphWidget(QtWidgets.QWidget):
+    frameClicked = QtCore.Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.results = {}
+        self.threshold = 15.0
+        self.setMinimumHeight(160)
+
+    def set_results(self, results, threshold):
+        self.results = results
+        self.threshold = float(threshold)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if not self.results:
+            return
+        frames = sorted({f for scores in self.results.values() for f in scores})
+        if not frames:
+            return
+        margin = 32
+        usable = max(1, self.width() - margin * 2)
+        x = max(margin, min(self.width() - margin, event.position().x() if hasattr(event, "position") else event.x()))
+        index = int(round((x - margin) / usable * (len(frames) - 1)))
+        self.frameClicked.emit(frames[max(0, min(index, len(frames) - 1))])
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QtGui.QColor(30, 32, 36))
+        margin = 32
+        plot = rect.adjusted(margin, 16, -16, -28)
+        painter.setPen(QtGui.QColor(90, 92, 98))
+        painter.drawRect(plot)
+        if not self.results:
+            painter.setPen(QtGui.QColor(150, 150, 150))
+            painter.drawText(rect, QtCore.Qt.AlignCenter, "スキャン結果なし")
+            return
+
+        frames = sorted({f for scores in self.results.values() for f in scores})
+        max_score = max([self.threshold] + [v for scores in self.results.values() for v in scores.values()])
+        max_score = max(max_score, 1.0)
+
+        def point(frame, score):
+            xi = frames.index(frame) if frame in frames else 0
+            x = plot.left() + (xi / max(1, len(frames) - 1)) * plot.width()
+            y = plot.bottom() - (score / max_score) * plot.height()
+            return QtCore.QPointF(x, y)
+
+        threshold_y = plot.bottom() - (self.threshold / max_score) * plot.height()
+        painter.setPen(QtGui.QPen(QtGui.QColor(220, 80, 70), 1, QtCore.Qt.DashLine))
+        painter.drawLine(QtCore.QPointF(plot.left(), threshold_y), QtCore.QPointF(plot.right(), threshold_y))
+
+        for chain_index, (label, scores) in enumerate(self.results.items()):
+            color = COLORS[chain_index % len(COLORS)]
+            qcolor = QtGui.QColor.fromRgbF(*color)
+            painter.setPen(QtGui.QPen(qcolor, 2))
+            path = QtGui.QPainterPath()
+            sorted_scores = sorted(scores.items())
+            for i, (frame, score) in enumerate(sorted_scores):
+                p = point(frame, score)
+                if i == 0:
+                    path.moveTo(p)
+                else:
+                    path.lineTo(p)
+            painter.drawPath(path)
+            painter.setBrush(qcolor)
+            for frame, score in sorted_scores:
+                if score > self.threshold:
+                    painter.drawEllipse(point(frame, score), 4, 4)
+
+
+class TailCodeTATool(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _require_maya()
+        self.setObjectName(WINDOW_OBJECT_NAME)
+        self.setWindowTitle("尻尾・コード TA ツール")
+        self.resize(920, 820)
+        self.chains = []
+        self.callbacks = []
+        self.is_monitoring = False
+        self.scan_results = {}
+        self._build_ui()
+        self.load_scene_data()
+        self.refresh_all()
+
+    def _build_ui(self):
+        main = QtWidgets.QVBoxLayout(self)
+
+        register_box = QtWidgets.QGroupBox("チェーン登録")
+        reg_layout = QtWidgets.QGridLayout(register_box)
+        self.label_edit = QtWidgets.QLineEdit()
+        self.label_edit.setPlaceholderText("例：右手_親指 / 尻尾A")
+        self.joints_edit = QtWidgets.QPlainTextEdit()
+        self.joints_edit.setPlaceholderText("ジョイント名を1行ずつ入力。空欄の場合は現在の選択を使います。")
+        self.joints_edit.setMaximumHeight(78)
+        self.threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_spin.setRange(0.01, 9999.0)
+        self.threshold_spin.setValue(15.0)
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setSuffix(" 度（曲がり）")
+        add_button = QtWidgets.QPushButton("選択チェーンを登録")
+        add_button.clicked.connect(self.register_chain)
+        update_button = QtWidgets.QPushButton("選択チェーンを更新")
+        update_button.clicked.connect(self.update_selected_chain)
+        remove_button = QtWidgets.QPushButton("削除")
+        remove_button.clicked.connect(self.remove_selected_chain)
+        reg_layout.addWidget(QtWidgets.QLabel("ラベル"), 0, 0)
+        reg_layout.addWidget(self.label_edit, 0, 1, 1, 3)
+        reg_layout.addWidget(QtWidgets.QLabel("ジョイント"), 1, 0)
+        reg_layout.addWidget(self.joints_edit, 1, 1, 1, 3)
+        reg_layout.addWidget(QtWidgets.QLabel("角度差しきい値"), 2, 0)
+        reg_layout.addWidget(self.threshold_spin, 2, 1)
+        reg_layout.addWidget(add_button, 2, 2)
+        reg_layout.addWidget(update_button, 2, 3)
+        reg_layout.addWidget(remove_button, 3, 3)
+        main.addWidget(register_box)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        self.chain_list = QtWidgets.QListWidget()
+        self.chain_list.currentRowChanged.connect(self.on_chain_selected)
+        left_layout.addWidget(QtWidgets.QLabel("登録済みチェーン"))
+        left_layout.addWidget(self.chain_list)
+        self.problem_list = QtWidgets.QListWidget()
+        left_layout.addWidget(QtWidgets.QLabel("角度差が大きいジョイント"))
+        left_layout.addWidget(self.problem_list)
+        splitter.addWidget(left)
+
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        self.score_label = QtWidgets.QLabel("曲がりスコア: -")
+        self.angle_table = QtWidgets.QTableWidget(0, 9)
+        self.angle_table.setHorizontalHeaderLabels(
+            ["ジョイント", "曲がり", "回転 X", "回転 Y", "回転 Z", "差分 X", "差分 Y", "差分 Z", "最大差"]
+        )
+        self.angle_table.horizontalHeader().setStretchLastSection(True)
+        self.angle_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        for column in range(1, 8):
+            self.angle_table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeToContents)
+        self.angle_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.angle_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.angle_table.setMinimumHeight(190)
+        self.heatmap = HeatMapWidget()
+        self.angle_graph = BendGraphWidget()
+        self.graph = ScoreGraphWidget()
+        self.graph.frameClicked.connect(self.goto_frame)
+        right_layout.addWidget(self.score_label)
+        right_layout.addWidget(self.angle_table)
+        right_layout.addWidget(QtWidgets.QLabel("現在フレームの曲がり折れ線グラフ"))
+        right_layout.addWidget(self.angle_graph)
+        right_layout.addWidget(QtWidgets.QLabel("曲がりヒートマップ"))
+        right_layout.addWidget(self.heatmap)
+        right_layout.addWidget(QtWidgets.QLabel("範囲スキャン結果"))
+        right_layout.addWidget(self.graph)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(1, 2)
+        main.addWidget(splitter, 1)
+
+        monitor_layout = QtWidgets.QHBoxLayout()
+        self.start_button = QtWidgets.QPushButton("監視開始")
+        self.stop_button = QtWidgets.QPushButton("監視停止")
+        self.start_button.clicked.connect(self.start_monitoring)
+        self.stop_button.clicked.connect(self.stop_monitoring)
+        self.stop_button.setEnabled(False)
+        monitor_layout.addWidget(self.start_button)
+        monitor_layout.addWidget(self.stop_button)
+        monitor_layout.addStretch()
+        main.addLayout(monitor_layout)
+
+        tweaker_box = QtWidgets.QGroupBox("Tail Tweaker")
+        tweaker_layout = QtWidgets.QGridLayout(tweaker_box)
+        create_tweaker_button = QtWidgets.QPushButton("Create Tweaker")
+        create_tweaker_button.clicked.connect(self.create_tweaker_for_selection)
+        delete_tweaker_button = QtWidgets.QPushButton("Delete Tweaker")
+        delete_tweaker_button.clicked.connect(self.delete_selected_tweakers)
+        bake_tweaker_button = QtWidgets.QPushButton("Bake Tweaker")
+        bake_tweaker_button.clicked.connect(self.bake_selected_tweakers)
+        auto_tweaker_button = QtWidgets.QPushButton("Auto Tweaker")
+        auto_tweaker_button.clicked.connect(self.auto_create_tweaker)
+        suggest_button = QtWidgets.QPushButton("Smart Suggest")
+        suggest_button.clicked.connect(self.smart_suggest)
+        self.tweaker_status = QtWidgets.QLabel("選択ジョイントに一時補助コントローラを作成できます。")
+        self.tweaker_status.setWordWrap(True)
+        tweaker_layout.addWidget(create_tweaker_button, 0, 0)
+        tweaker_layout.addWidget(delete_tweaker_button, 0, 1)
+        tweaker_layout.addWidget(bake_tweaker_button, 0, 2)
+        tweaker_layout.addWidget(auto_tweaker_button, 0, 3)
+        tweaker_layout.addWidget(suggest_button, 0, 4)
+        tweaker_layout.addWidget(self.tweaker_status, 1, 0, 1, 5)
+        main.addWidget(tweaker_box)
+
+        scan_box = QtWidgets.QGroupBox("アニメーション範囲評価")
+        scan_layout = QtWidgets.QGridLayout(scan_box)
+        self.start_frame = QtWidgets.QSpinBox()
+        self.end_frame = QtWidgets.QSpinBox()
+        for spin in (self.start_frame, self.end_frame):
+            spin.setRange(-100000, 100000)
+        self.start_frame.setValue(int(cmds.playbackOptions(query=True, minTime=True)))
+        self.end_frame.setValue(int(cmds.playbackOptions(query=True, maxTime=True)))
+        self.scan_progress = QtWidgets.QProgressBar()
+        self.cancel_scan_button = QtWidgets.QPushButton("キャンセル")
+        self.cancel_scan_button.setEnabled(False)
+        self.cancel_scan = False
+        self.cancel_scan_button.clicked.connect(self._cancel_scan)
+        scan_button = QtWidgets.QPushButton("範囲スキャン")
+        scan_button.clicked.connect(self.scan_range)
+        export_button = QtWidgets.QPushButton("CSV書き出し")
+        export_button.clicked.connect(self.export_csv)
+        scan_layout.addWidget(QtWidgets.QLabel("開始"), 0, 0)
+        scan_layout.addWidget(self.start_frame, 0, 1)
+        scan_layout.addWidget(QtWidgets.QLabel("終了"), 0, 2)
+        scan_layout.addWidget(self.end_frame, 0, 3)
+        scan_layout.addWidget(scan_button, 0, 4)
+        scan_layout.addWidget(export_button, 0, 5)
+        scan_layout.addWidget(self.scan_progress, 1, 0, 1, 5)
+        scan_layout.addWidget(self.cancel_scan_button, 1, 5)
+        main.addWidget(scan_box)
+
+    def _selected_chain(self):
+        row = self.chain_list.currentRow()
+        if 0 <= row < len(self.chains):
+            return self.chains[row]
+        return None
+
+    def _input_joints(self):
+        raw = self.joints_edit.toPlainText().strip()
+        if raw:
+            joints = [line.strip() for line in raw.replace(",", "\n").splitlines() if line.strip()]
+        else:
+            joints = cmds.ls(selection=True, type="joint") or []
+        return sort_root_to_tip(joints)
+
+    def register_chain(self):
+        try:
+            joints = self._input_joints()
+            if len(joints) < 3:
+                cmds.warning("3つ以上のジョイントを指定してください。")
+                return
+            label = self.label_edit.text().strip() or "chain_%02d" % (len(self.chains) + 1)
+            chain = ChainData(
+                label=label,
+                joints=joints,
+                threshold=float(self.threshold_spin.value()),
+                color_index=len(self.chains) % len(COLORS),
+            )
+            self.chains.append(chain)
+            self.save_scene_data()
+            self.refresh_all()
+            self._register_callbacks_for_chain(chain)
+        except Exception:
+            self._show_error("チェーン登録に失敗しました")
+
+    def update_selected_chain(self):
+        chain = self._selected_chain()
+        if chain is None:
+            return
+        try:
+            joints = self._input_joints()
+            if len(joints) >= 3:
+                chain.joints = joints
+            chain.label = self.label_edit.text().strip() or chain.label
+            chain.threshold = float(self.threshold_spin.value())
+            self.save_scene_data()
+            self.restart_monitoring_if_needed()
+            self.refresh_all()
+        except Exception:
+            self._show_error("チェーン更新に失敗しました")
+
+    def remove_selected_chain(self):
+        row = self.chain_list.currentRow()
+        if not (0 <= row < len(self.chains)):
+            return
+        chain = self.chains.pop(row)
+        self._delete_display_curve(chain)
+        self.save_scene_data()
+        self.restart_monitoring_if_needed()
+        self.refresh_all()
+
+    def on_chain_selected(self, row):
+        chain = self._selected_chain()
+        if chain is None:
+            return
+        self.label_edit.setText(chain.label)
+        self.joints_edit.setPlainText("\n".join(chain.joints))
+        self.threshold_spin.setValue(chain.threshold)
+        self.refresh_details(chain)
+
+    def refresh_all(self):
+        self.chain_list.blockSignals(True)
+        current = self.chain_list.currentRow()
+        self.chain_list.clear()
+        for chain in self.chains:
+            item = QtWidgets.QListWidgetItem(chain.label)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked if chain.visible else QtCore.Qt.Unchecked)
+            color = QtGui.QColor.fromRgbF(*COLORS[chain.color_index % len(COLORS)])
+            item.setForeground(color)
+            self.chain_list.addItem(item)
+        self.chain_list.blockSignals(False)
+        try:
+            self.chain_list.itemChanged.disconnect(self._visibility_changed)
+        except Exception:
+            pass
+        self.chain_list.itemChanged.connect(self._visibility_changed)
+        if self.chains:
+            self.chain_list.setCurrentRow(max(0, min(current, len(self.chains) - 1)))
+        self.update_scores_and_display()
+
+    def _visibility_changed(self, item):
+        row = self.chain_list.row(item)
+        if 0 <= row < len(self.chains):
+            self.chains[row].visible = item.checkState() == QtCore.Qt.Checked
+            self.save_scene_data()
+            self.update_scores_and_display()
+
+    def refresh_details(self, chain):
+        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+        chain.last_score = result["score"]
+        chain.problem_joints = result["problem_joints"]
+        self.score_label.setText("曲がりスコア: %.3f    チェーン: %s" % (chain.last_score, chain.label))
+        self.problem_list.clear()
+        for joint in chain.problem_joints:
+            self.problem_list.addItem(joint)
+        self._fill_angle_table(result["angle_rows"], chain.threshold)
+        self.angle_graph.set_angle_rows(result["angle_rows"], chain.threshold)
+        self.heatmap.set_values(result["bend_values"], chain.threshold)
+
+    def _fill_angle_table(self, rows, threshold):
+        self.angle_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [
+                row["joint"],
+                "%.2f" % row["bend"],
+                "%.2f" % row["rotate"][0],
+                "%.2f" % row["rotate"][1],
+                "%.2f" % row["rotate"][2],
+                "%.2f" % row["delta"][0],
+                "%.2f" % row["delta"][1],
+                "%.2f" % row["delta"][2],
+                "%.2f" % row["max_delta"],
+            ]
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if column > 0:
+                    item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                if row["bend"] > threshold:
+                    item.setBackground(QtGui.QColor(85, 38, 34))
+                    item.setForeground(QtGui.QColor(255, 220, 210))
+                self.angle_table.setItem(row_index, column, item)
+
+    def update_scores_and_display(self):
+        selected = self._selected_chain()
+        for chain in self.chains:
+            if not chain.visible:
+                self._delete_display_curve(chain)
+                continue
+            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+            chain.last_score = result["score"]
+            chain.problem_joints = result["problem_joints"]
+            self._update_display_curve(chain, result["positions"])
+        if selected:
+            self.refresh_details(selected)
+        self.graph.set_results(self.scan_results, self.threshold_spin.value())
+
+    def _display_curve_name(self, chain):
+        return "tailCodeTATool_%s_CRV" % _safe_name(chain.label)
+
+    def _ensure_display_group(self):
+        if not cmds.objExists(DISPLAY_GROUP):
+            cmds.group(empty=True, name=DISPLAY_GROUP)
+            cmds.setAttr(DISPLAY_GROUP + ".inheritsTransform", 0)
+        return DISPLAY_GROUP
+
+    def _delete_display_curve(self, chain):
+        name = self._display_curve_name(chain)
+        if cmds.objExists(name):
+            cmds.delete(name)
+
+    def _update_display_curve(self, chain, positions):
+        name = self._display_curve_name(chain)
+        if len(positions) < 2:
+            self._delete_display_curve(chain)
+            return
+        self._ensure_display_group()
+        if cmds.objExists(name):
+            cmds.delete(name)
+        degree = 1 if len(positions) < 4 else 3
+        curve = cmds.curve(name=name, degree=degree, point=positions)
+        cmds.parent(curve, DISPLAY_GROUP)
+        shape = cmds.listRelatives(curve, shapes=True, fullPath=True) or []
+        color = COLORS[chain.color_index % len(COLORS)]
+        if shape:
+            shape = shape[0]
+            cmds.setAttr(shape + ".overrideEnabled", 1)
+            cmds.setAttr(shape + ".overrideRGBColors", 1)
+            cmds.setAttr(shape + ".overrideColorRGB", color[0], color[1], color[2])
+            if cmds.objExists(shape + ".lineWidth"):
+                cmds.setAttr(shape + ".lineWidth", 3)
+        cmds.setAttr(curve + ".template", 1)
+
+    def save_scene_data(self):
+        node = _ensure_data_node()
+        payload = json.dumps([c.to_dict() for c in self.chains], ensure_ascii=False)
+        cmds.setAttr("%s.%s" % (node, DATA_ATTR), payload, type="string")
+
+    def load_scene_data(self):
+        self.chains = []
+        if not cmds.objExists(DATA_NODE) or not cmds.attributeQuery(DATA_ATTR, node=DATA_NODE, exists=True):
+            return
+        raw = cmds.getAttr("%s.%s" % (DATA_NODE, DATA_ATTR)) or "[]"
+        try:
+            self.chains = [ChainData.from_dict(item) for item in json.loads(raw)]
+        except Exception:
+            cmds.warning("尻尾・コード TA ツール: シーン内データの復元に失敗しました。")
+            self.chains = []
+
+    def start_monitoring(self):
+        try:
+            self.stop_monitoring()
+            self.is_monitoring = True
+            for chain in self.chains:
+                self._register_callbacks_for_chain(chain)
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+        except Exception:
+            self._show_error("監視開始に失敗しました")
+
+    def _register_callbacks_for_chain(self, chain):
+        if not self.is_monitoring:
+            return
+        for joint in chain.joints:
+            if not _joint_exists(joint):
+                continue
+            sel = om.MSelectionList()
+            sel.add(joint)
+            obj = sel.getDependNode(0)
+            cb = om.MNodeMessage.addAttributeChangedCallback(obj, self._on_attribute_changed)
+            self.callbacks.append(cb)
+
+    def _on_attribute_changed(self, msg, plug, other_plug, client_data):
+        if not (msg & om.MNodeMessage.kAttributeSet):
+            return
+        QtCore.QTimer.singleShot(0, self.update_scores_and_display)
+
+    def stop_monitoring(self):
+        if self.callbacks and om is not None:
+            for cb in self.callbacks:
+                try:
+                    om.MMessage.removeCallback(cb)
+                except Exception:
+                    pass
+        self.callbacks = []
+        self.is_monitoring = False
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+
+    def restart_monitoring_if_needed(self):
+        if self.is_monitoring:
+            self.start_monitoring()
+
+    def _ensure_tweaker_group(self):
+        if not cmds.objExists(TWEAKER_GROUP):
+            cmds.group(empty=True, name=TWEAKER_GROUP)
+            cmds.setAttr(TWEAKER_GROUP + ".inheritsTransform", 0)
+        return TWEAKER_GROUP
+
+    def _tweaker_name_for_joint(self, joint):
+        return TWEAKER_PREFIX + _safe_name(joint.split("|")[-1])
+
+    def _all_tweakers(self):
+        transforms = cmds.ls(type="transform") or []
+        return [node for node in transforms if _is_tweaker(node)]
+
+    def _tweakers_from_selection(self):
+        selected = cmds.ls(selection=True, long=False) or []
+        tweakers = []
+        for node in selected:
+            if _is_tweaker(node):
+                tweakers.append(node)
+                continue
+            if _joint_exists(node):
+                tweakers.extend(self._tweakers_for_joint(node))
+        return list(dict.fromkeys(tweakers))
+
+    def _tweakers_for_joint(self, joint):
+        joint_long = _dag_path(joint)
+        result = []
+        for tweaker in self._all_tweakers():
+            target = _get_string_attr(tweaker, "targetJoint")
+            target_long = _dag_path(target) if target and cmds.objExists(target) else target
+            if target == joint or target == joint_long or target_long == joint_long:
+                result.append(tweaker)
+        return result
+
+    def _selected_tweaker_targets(self):
+        joints = cmds.ls(selection=True, type="joint") or []
+        if joints:
+            return sort_root_to_tip(joints)
+        current_problem = self.problem_list.currentItem()
+        if current_problem:
+            joint = current_problem.text()
+            if _joint_exists(joint):
+                return [joint]
+        return []
+
+    def create_tweaker_for_selection(self):
+        try:
+            targets = self._selected_tweaker_targets()
+            if not targets:
+                cmds.warning("Tweaker を作成するジョイントを選択してください。")
+                return
+            created = []
+            for joint in targets:
+                created.append(self._create_tweaker(joint))
+            cmds.select(created, replace=True)
+            self.tweaker_status.setText("作成: %s" % ", ".join(created))
+        except Exception:
+            self._show_error("Tweaker 作成に失敗しました")
+
+    def _create_tweaker(self, joint):
+        if not _joint_exists(joint):
+            raise RuntimeError("ジョイントが見つかりません: %s" % joint)
+
+        existing = self._tweakers_for_joint(joint)
+        if existing:
+            return existing[0]
+
+        group = self._ensure_tweaker_group()
+        name = self._tweaker_name_for_joint(joint)
+        tweaker = cmds.spaceLocator(name=name)[0]
+        joint_matrix = cmds.xform(joint, query=True, worldSpace=True, matrix=True)
+        cmds.xform(tweaker, worldSpace=True, matrix=joint_matrix)
+        for axis in "XYZ":
+            if cmds.objExists(tweaker + ".localScale" + axis):
+                cmds.setAttr(tweaker + ".localScale" + axis, 1.5)
+        cmds.parent(tweaker, group)
+        _add_bool_attr(tweaker, "tailTweaker", True)
+        _add_string_attr(tweaker, "targetJoint", _dag_path(joint))
+
+        rotate_attrs = ["%s.rotate%s" % (joint, axis) for axis in "XYZ"]
+        if any(_attr_has_incoming_connection(attr) for attr in rotate_attrs):
+            self._connect_additive_tweaker(tweaker, joint)
+            _add_string_attr(tweaker, "connectionMode", "additiveRotate")
+        else:
+            existing_constraint = _find_orient_constraint_driving(joint)
+            if existing_constraint:
+                cmds.orientConstraint(tweaker, joint, edit=True, maintainOffset=True, weight=1.0)
+                constraint = existing_constraint
+                _add_bool_attr(tweaker, "usesExistingConstraint", True)
+            else:
+                constraint = cmds.orientConstraint(tweaker, joint, maintainOffset=True, name=tweaker + "_orientConstraint")[0]
+                _add_bool_attr(tweaker, "usesExistingConstraint", False)
+            _add_string_attr(tweaker, "constraintNode", constraint)
+            _add_string_attr(tweaker, "connectionMode", "constraint")
+        return tweaker
+
+    def _connect_additive_tweaker(self, tweaker, joint):
+        nodes = []
+        for axis in "XYZ":
+            target_attr = "%s.rotate%s" % (joint, axis)
+            tweaker_attr = "%s.rotate%s" % (tweaker, axis)
+            source_attr = _incoming_plug(target_attr)
+            base_value = cmds.getAttr(target_attr)
+            plus = cmds.createNode("plusMinusAverage", name="%s_addRotate%s_PMA" % (tweaker, axis))
+            cmds.setAttr(plus + ".operation", 1)
+            if source_attr:
+                cmds.disconnectAttr(source_attr, target_attr)
+                cmds.connectAttr(source_attr, plus + ".input1D[0]", force=True)
+            else:
+                cmds.setAttr(plus + ".input1D[0]", base_value)
+            cmds.connectAttr(tweaker_attr, plus + ".input1D[1]", force=True)
+            cmds.connectAttr(plus + ".output1D", target_attr, force=True)
+            _add_string_attr(tweaker, "sourceRotate%s" % axis, source_attr)
+            _add_string_attr(tweaker, "addNode%s" % axis, plus)
+            _add_string_attr(tweaker, "baseRotate%s" % axis, str(base_value))
+            nodes.append(plus)
+        _add_string_attr(tweaker, "additiveNodes", "|".join(nodes))
+
+    def _disconnect_additive_tweaker(self, tweaker, keep_final=False):
+        target = _get_string_attr(tweaker, "targetJoint")
+        final_rotate = _rotate_values(target) if _joint_exists(target) else (0.0, 0.0, 0.0)
+        for index, axis in enumerate("XYZ"):
+            target_attr = "%s.rotate%s" % (target, axis)
+            source_attr = _get_string_attr(tweaker, "sourceRotate%s" % axis)
+            plus = _get_string_attr(tweaker, "addNode%s" % axis)
+            if plus and cmds.objExists(plus + ".output1D") and cmds.objExists(target_attr):
+                try:
+                    if cmds.isConnected(plus + ".output1D", target_attr):
+                        cmds.disconnectAttr(plus + ".output1D", target_attr)
+                except Exception:
+                    pass
+            if source_attr and cmds.objExists(source_attr) and cmds.objExists(target_attr):
+                try:
+                    cmds.connectAttr(source_attr, target_attr, force=True)
+                except Exception:
+                    cmds.warning("元の回転接続を復元できませんでした: %s -> %s" % (source_attr, target_attr))
+            elif keep_final and cmds.objExists(target_attr) and not cmds.getAttr(target_attr, lock=True):
+                cmds.setAttr(target_attr, final_rotate[index])
+            elif cmds.objExists(target_attr) and not cmds.getAttr(target_attr, lock=True):
+                try:
+                    base_value = float(_get_string_attr(tweaker, "baseRotate%s" % axis, "0"))
+                    cmds.setAttr(target_attr, base_value)
+                except Exception:
+                    pass
+            if plus and cmds.objExists(plus):
+                cmds.delete(plus)
+
+    def _delete_constraint_tweaker_link(self, tweaker):
+        constraint = _get_string_attr(tweaker, "constraintNode")
+        uses_existing = bool(
+            cmds.attributeQuery("usesExistingConstraint", node=tweaker, exists=True)
+            and cmds.getAttr(tweaker + ".usesExistingConstraint")
+        )
+        target = _get_string_attr(tweaker, "targetJoint")
+        if uses_existing and constraint and cmds.objExists(constraint) and _joint_exists(target):
+            try:
+                cmds.orientConstraint(tweaker, target, edit=True, remove=True)
+            except Exception:
+                cmds.warning("既存 constraint から Tweaker ターゲットを外せませんでした: %s" % tweaker)
+        elif constraint and cmds.objExists(constraint):
+            cmds.delete(constraint)
+        child_constraints = cmds.listConnections(tweaker, source=False, destination=True, type="orientConstraint") or []
+        for constraint_node in child_constraints:
+            if cmds.objExists(constraint_node) and constraint_node != constraint:
+                cmds.delete(constraint_node)
+
+    def delete_selected_tweakers(self):
+        try:
+            tweakers = self._tweakers_from_selection()
+            if not tweakers:
+                cmds.warning("削除する Tweaker、または対象ジョイントを選択してください。")
+                return
+            self._delete_tweakers(tweakers)
+            self.tweaker_status.setText("削除: %s" % ", ".join(tweakers))
+            self.update_scores_and_display()
+        except Exception:
+            self._show_error("Tweaker 削除に失敗しました")
+
+    def _delete_tweakers(self, tweakers):
+        for tweaker in tweakers:
+            if not cmds.objExists(tweaker):
+                continue
+            constraint = _get_string_attr(tweaker, "constraintNode")
+            uses_existing = bool(
+                cmds.attributeQuery("usesExistingConstraint", node=tweaker, exists=True)
+                and cmds.getAttr(tweaker + ".usesExistingConstraint")
+            )
+            target = _get_string_attr(tweaker, "targetJoint")
+            if uses_existing and constraint and cmds.objExists(constraint) and _joint_exists(target):
+                try:
+                    cmds.orientConstraint(tweaker, target, edit=True, remove=True)
+                except Exception:
+                    cmds.warning("既存 constraint から Tweaker ターゲットを外せませんでした: %s" % tweaker)
+            elif constraint and cmds.objExists(constraint):
+                cmds.delete(constraint)
+            child_constraints = cmds.listConnections(tweaker, source=False, destination=True, type="orientConstraint") or []
+            for constraint_node in child_constraints:
+                if cmds.objExists(constraint_node) and constraint_node != constraint:
+                    cmds.delete(constraint_node)
+            if cmds.objExists(tweaker):
+                cmds.delete(tweaker)
+
+    def bake_selected_tweakers(self):
+        try:
+            tweakers = self._tweakers_from_selection()
+            if not tweakers:
+                cmds.warning("Bake する Tweaker、または対象ジョイントを選択してください。")
+                return
+            baked = []
+            for tweaker in tweakers:
+                target = _get_string_attr(tweaker, "targetJoint")
+                if not _joint_exists(target):
+                    cmds.warning("対象ジョイントが見つかりません: %s" % target)
+                    continue
+                final_rotate = _rotate_values(target)
+                constraint = _get_string_attr(tweaker, "constraintNode")
+                uses_existing = bool(
+                    cmds.attributeQuery("usesExistingConstraint", node=tweaker, exists=True)
+                    and cmds.getAttr(tweaker + ".usesExistingConstraint")
+                )
+                if uses_existing and constraint and cmds.objExists(constraint):
+                    try:
+                        cmds.orientConstraint(tweaker, target, edit=True, remove=True)
+                    except Exception:
+                        cmds.warning("既存 constraint から Tweaker ターゲットを外せませんでした: %s" % tweaker)
+                elif constraint and cmds.objExists(constraint):
+                    cmds.delete(constraint)
+                for axis, value in zip("XYZ", final_rotate):
+                    attr = "%s.rotate%s" % (target, axis)
+                    if cmds.objExists(attr) and not cmds.getAttr(attr, lock=True) and not _attr_has_incoming_connection(attr):
+                        cmds.setAttr(attr, value)
+                if cmds.autoKeyframe(query=True, state=True):
+                    cmds.setKeyframe(target, attribute=["rotateX", "rotateY", "rotateZ"])
+                if cmds.objExists(tweaker):
+                    cmds.delete(tweaker)
+                baked.append(target)
+            self.tweaker_status.setText("Bake 完了: %s" % ", ".join(baked))
+            self.update_scores_and_display()
+        except Exception:
+            self._show_error("Tweaker Bake に失敗しました")
+
+    def auto_create_tweaker(self):
+        try:
+            chain = self._selected_chain()
+            if chain is None:
+                cmds.warning("Auto Tweaker 用のチェーンを選択してください。")
+                return
+            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+            rows = [row for row in result["angle_rows"] if row["bend"] > chain.threshold]
+            if not rows:
+                cmds.warning("しきい値を超える曲がり箇所がありません。")
+                return
+            target_row = max(rows, key=lambda row: row["bend"])
+            tweaker = self._create_tweaker(target_row["joint"])
+            cmds.select(tweaker, replace=True)
+            self.tweaker_status.setText("Auto Tweaker: %s  曲がり %.2f 度" % (target_row["joint"], target_row["bend"]))
+        except Exception:
+            self._show_error("Auto Tweaker に失敗しました")
+
+    def smart_suggest(self):
+        try:
+            chain = self._selected_chain()
+            if chain is None:
+                cmds.warning("Smart Suggest 用のチェーンを選択してください。")
+                return
+            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+            rows = result["angle_rows"]
+            if not rows:
+                return
+            indexed = [(index, row) for index, row in enumerate(rows)]
+            index, row = max(indexed, key=lambda item: item[1]["bend"])
+            if row["bend"] <= chain.threshold:
+                self.tweaker_status.setText("Smart Suggest: 目立つ曲がり超過はありません。")
+                return
+            prev_rotate = rows[index - 1]["rotate"] if index > 0 else (0.0, 0.0, 0.0)
+            rotate = row["rotate"]
+            deltas = [rotate[i] - prev_rotate[i] for i in range(3)]
+            axis_index = max(range(3), key=lambda i: abs(deltas[i]))
+            axis = "XYZ"[axis_index]
+            amount = max(-15.0, min(15.0, -deltas[axis_index] * 0.5))
+            self.tweaker_status.setText(
+                "Smart Suggest: %s の曲がり %.2f 度。TailTweaker で R%s %+0.2f 度を目安に調整してください。"
+                % (row["joint"], row["bend"], axis, amount)
+            )
+        except Exception:
+            self._show_error("Smart Suggest に失敗しました")
+
+    def scan_range(self):
+        if not self.chains:
+            cmds.warning("登録済みチェーンがありません。")
+            return
+        was_monitoring = self.is_monitoring
+        self.stop_monitoring()
+        self.cancel_scan = False
+        self.cancel_scan_button.setEnabled(True)
+        start = min(self.start_frame.value(), self.end_frame.value())
+        end = max(self.start_frame.value(), self.end_frame.value())
+        current = cmds.currentTime(query=True)
+        frames = list(range(start, end + 1))
+        self.scan_progress.setRange(0, len(frames))
+        results = {chain.label: {} for chain in self.chains if chain.visible}
+        try:
+            for index, frame in enumerate(frames, 1):
+                if self.cancel_scan:
+                    break
+                cmds.currentTime(frame, edit=True)
+                for chain in self.chains:
+                    if chain.visible:
+                        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+                        results[chain.label][frame] = max(result["bend_values"] or [0.0])
+                self.scan_progress.setValue(index)
+                QtWidgets.QApplication.processEvents()
+            self.scan_results = results
+            max_threshold = max([c.threshold for c in self.chains] or [self.threshold_spin.value()])
+            self.graph.set_results(self.scan_results, max_threshold)
+        except Exception:
+            self._show_error("範囲スキャンに失敗しました")
+        finally:
+            cmds.currentTime(current, edit=True)
+            self.cancel_scan_button.setEnabled(False)
+            if was_monitoring:
+                self.start_monitoring()
+            self.update_scores_and_display()
+
+    def _cancel_scan(self):
+        self.cancel_scan = True
+
+    def goto_frame(self, frame):
+        cmds.currentTime(frame, edit=True)
+        self.update_scores_and_display()
+
+    def export_csv(self):
+        if not self.scan_results:
+            cmds.warning("書き出すスキャン結果がありません。")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "CSV書き出し", "tail_code_ta_bend_scores.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        frames = sorted({f for scores in self.scan_results.values() for f in scores})
+        labels = list(self.scan_results.keys())
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["frame"] + labels)
+                for frame in frames:
+                    writer.writerow([frame] + [self.scan_results[label].get(frame, "") for label in labels])
+        except Exception:
+            self._show_error("CSV書き出しに失敗しました")
+
+    def closeEvent(self, event):
+        self.stop_monitoring()
+        self.save_scene_data()
+        super().closeEvent(event)
+
+    def _show_error(self, title):
+        detail = traceback.format_exc()
+        cmds.warning("%s: %s" % (title, detail))
+        QtWidgets.QMessageBox.critical(self, title, detail)
+
+
+def show():
+    _require_maya()
+    if QtWidgets is None:
+        raise RuntimeError("PySide6 / PySide2 is not available.")
+    for widget in QtWidgets.QApplication.topLevelWidgets():
+        if widget.objectName() == WINDOW_OBJECT_NAME:
+            widget.close()
+            widget.deleteLater()
+    dialog = TailCodeTATool(parent=_maya_main_window())
+    dialog.show()
+    return dialog
