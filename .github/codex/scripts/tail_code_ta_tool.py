@@ -1053,23 +1053,11 @@ class TailCodeTATool(QtWidgets.QDialog):
         for tweaker in tweakers:
             if not cmds.objExists(tweaker):
                 continue
-            constraint = _get_string_attr(tweaker, "constraintNode")
-            uses_existing = bool(
-                cmds.attributeQuery("usesExistingConstraint", node=tweaker, exists=True)
-                and cmds.getAttr(tweaker + ".usesExistingConstraint")
-            )
-            target = _get_string_attr(tweaker, "targetJoint")
-            if uses_existing and constraint and cmds.objExists(constraint) and _joint_exists(target):
-                try:
-                    cmds.orientConstraint(tweaker, target, edit=True, remove=True)
-                except Exception:
-                    cmds.warning("既存 constraint から Tweaker ターゲットを外せませんでした: %s" % tweaker)
-            elif constraint and cmds.objExists(constraint):
-                cmds.delete(constraint)
-            child_constraints = cmds.listConnections(tweaker, source=False, destination=True, type="orientConstraint") or []
-            for constraint_node in child_constraints:
-                if cmds.objExists(constraint_node) and constraint_node != constraint:
-                    cmds.delete(constraint_node)
+            mode = _get_string_attr(tweaker, "connectionMode", "constraint")
+            if mode == "additiveRotate":
+                self._disconnect_additive_tweaker(tweaker, keep_final=False)
+            else:
+                self._delete_constraint_tweaker_link(tweaker)
             if cmds.objExists(tweaker):
                 cmds.delete(tweaker)
 
@@ -1086,18 +1074,11 @@ class TailCodeTATool(QtWidgets.QDialog):
                     cmds.warning("対象ジョイントが見つかりません: %s" % target)
                     continue
                 final_rotate = _rotate_values(target)
-                constraint = _get_string_attr(tweaker, "constraintNode")
-                uses_existing = bool(
-                    cmds.attributeQuery("usesExistingConstraint", node=tweaker, exists=True)
-                    and cmds.getAttr(tweaker + ".usesExistingConstraint")
-                )
-                if uses_existing and constraint and cmds.objExists(constraint):
-                    try:
-                        cmds.orientConstraint(tweaker, target, edit=True, remove=True)
-                    except Exception:
-                        cmds.warning("既存 constraint から Tweaker ターゲットを外せませんでした: %s" % tweaker)
-                elif constraint and cmds.objExists(constraint):
-                    cmds.delete(constraint)
+                mode = _get_string_attr(tweaker, "connectionMode", "constraint")
+                if mode == "additiveRotate":
+                    self._disconnect_additive_tweaker(tweaker, keep_final=True)
+                else:
+                    self._delete_constraint_tweaker_link(tweaker)
                 for axis, value in zip("XYZ", final_rotate):
                     attr = "%s.rotate%s" % (target, axis)
                     if cmds.objExists(attr) and not cmds.getAttr(attr, lock=True) and not _attr_has_incoming_connection(attr):
