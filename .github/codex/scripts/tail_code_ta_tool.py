@@ -11,9 +11,9 @@ Maya scripts folder or loaded directly from the Script Editor.
 
 from __future__ import annotations
 
-import csv
 import json
 import math
+import time
 import traceback
 from dataclasses import dataclass, field
 
@@ -302,38 +302,6 @@ class JointAngleAnalyzer:
 CurvatureAnalyzer = JointAngleAnalyzer
 
 
-class HeatMapWidget(QtWidgets.QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.values = []
-        self.threshold = 15.0
-        self.setMinimumHeight(52)
-
-    def set_values(self, values, threshold):
-        values = list(values)
-        self.values = values[1:-1] if len(values) > 2 else []
-        self.threshold = max(float(threshold), 0.001)
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtGui.QColor(36, 38, 42))
-        if not self.values:
-            painter.setPen(QtGui.QColor(150, 150, 150))
-            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "曲がりデータなし")
-            return
-
-        count = len(self.values)
-        width = max(1, self.width() / float(count))
-        max_value = max(max(self.values), 1.0)
-        for i, value in enumerate(self.values):
-            ratio = max(0.0, min(1.0, value / max_value))
-            r = int(55 + ratio * 200)
-            g = int(170 - ratio * 120)
-            b = int(105 - ratio * 45)
-            painter.fillRect(QtCore.QRectF(i * width, 0, width + 1, self.height()), QtGui.QColor(r, g, b))
-
-
 class BendGraphWidget(QtWidgets.QWidget):
     bendEditStarted = QtCore.Signal()
     bendEdited = QtCore.Signal(int, float)
@@ -476,79 +444,6 @@ class BendGraphWidget(QtWidgets.QWidget):
         painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
 
 
-class ScoreGraphWidget(QtWidgets.QWidget):
-    frameClicked = QtCore.Signal(int)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.results = {}
-        self.threshold = 15.0
-        self.setMinimumHeight(160)
-
-    def set_results(self, results, threshold):
-        self.results = results
-        self.threshold = float(threshold)
-        self.update()
-
-    def mousePressEvent(self, event):
-        if not self.results:
-            return
-        frames = sorted({f for scores in self.results.values() for f in scores})
-        if not frames:
-            return
-        margin = 32
-        usable = max(1, self.width() - margin * 2)
-        x = max(margin, min(self.width() - margin, event.position().x() if hasattr(event, "position") else event.x()))
-        index = int(round((x - margin) / usable * (len(frames) - 1)))
-        self.frameClicked.emit(frames[max(0, min(index, len(frames) - 1))])
-
-    def paintEvent(self, event):
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        rect = self.rect()
-        painter.fillRect(rect, QtGui.QColor(30, 32, 36))
-        margin = 32
-        plot = rect.adjusted(margin, 16, -16, -28)
-        painter.setPen(QtGui.QColor(90, 92, 98))
-        painter.drawRect(plot)
-        if not self.results:
-            painter.setPen(QtGui.QColor(150, 150, 150))
-            painter.drawText(rect, QtCore.Qt.AlignCenter, "スキャン結果なし")
-            return
-
-        frames = sorted({f for scores in self.results.values() for f in scores})
-        max_score = max([self.threshold] + [v for scores in self.results.values() for v in scores.values()])
-        max_score = max(max_score, 1.0)
-
-        def point(frame, score):
-            xi = frames.index(frame) if frame in frames else 0
-            x = plot.left() + (xi / max(1, len(frames) - 1)) * plot.width()
-            y = plot.bottom() - (score / max_score) * plot.height()
-            return QtCore.QPointF(x, y)
-
-        threshold_y = plot.bottom() - (self.threshold / max_score) * plot.height()
-        painter.setPen(QtGui.QPen(QtGui.QColor(220, 80, 70), 1, QtCore.Qt.DashLine))
-        painter.drawLine(QtCore.QPointF(plot.left(), threshold_y), QtCore.QPointF(plot.right(), threshold_y))
-
-        for chain_index, (label, scores) in enumerate(self.results.items()):
-            color = COLORS[chain_index % len(COLORS)]
-            qcolor = QtGui.QColor.fromRgbF(*color)
-            painter.setPen(QtGui.QPen(qcolor, 2))
-            path = QtGui.QPainterPath()
-            sorted_scores = sorted(scores.items())
-            for i, (frame, score) in enumerate(sorted_scores):
-                p = point(frame, score)
-                if i == 0:
-                    path.moveTo(p)
-                else:
-                    path.lineTo(p)
-            painter.drawPath(path)
-            painter.setBrush(qcolor)
-            for frame, score in sorted_scores:
-                if score > self.threshold:
-                    painter.drawEllipse(point(frame, score), 4, 4)
-
-
 class TailCodeTATool(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -561,8 +456,11 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.is_monitoring = False
         self._monitored_joint_paths = set()
         self._pending_score_update = False
+        self._last_auto_score_update = 0.0
+        self._auto_score_update_interval_ms = 160
         self._tweaker_scan_cache = None
-        self.scan_results = {}
+        self._pending_graph_edits = {}
+        self._pending_graph_edit_label = ""
         self.graph_undo_open = False
         self._build_ui()
         self._install_undo_redo_shortcuts()
@@ -668,40 +566,21 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.angle_table.cellClicked.connect(self.on_angle_table_cell_clicked)
         self.angle_table.currentCellChanged.connect(self.on_angle_table_current_cell_changed)
         self.angle_table.setMinimumHeight(190)
-        self.heatmap = HeatMapWidget()
         self.angle_graph = BendGraphWidget()
         self.angle_graph.bendEditStarted.connect(self.begin_graph_undo)
         self.angle_graph.bendEdited.connect(self.apply_bend_edit)
         self.angle_graph.bendEditFinished.connect(self.end_graph_undo)
-        self.graph = ScoreGraphWidget()
-        self.graph.frameClicked.connect(self.goto_frame)
-        match_layout = QtWidgets.QHBoxLayout()
-        match_button = QtWidgets.QPushButton("選択曲がりに近似")
-        match_button.clicked.connect(self.match_bend_to_selected)
-        align_button = QtWidgets.QPushButton("選択曲がりに揃える")
-        align_button.clicked.connect(self.align_bend_to_selected)
-        add_button = QtWidgets.QPushButton("曲がり差分を加算")
-        add_button.clicked.connect(self.add_bend_delta_to_others)
-        match_layout.addWidget(match_button)
-        match_layout.addWidget(align_button)
-        match_layout.addWidget(add_button)
-        match_layout.addStretch()
         right_layout.addWidget(self.score_label)
         right_layout.addWidget(self.angle_table)
-        right_layout.addLayout(match_layout)
         right_layout.addWidget(QtWidgets.QLabel("現在フレームの曲がり折れ線グラフ"))
         right_layout.addWidget(self.angle_graph)
-        right_layout.addWidget(QtWidgets.QLabel("曲がりヒートマップ"))
-        right_layout.addWidget(self.heatmap)
-        right_layout.addWidget(QtWidgets.QLabel("範囲スキャン結果"))
-        right_layout.addWidget(self.graph)
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 2)
         main.addWidget(splitter, 1)
 
         monitor_layout = QtWidgets.QHBoxLayout()
-        self.start_button = QtWidgets.QPushButton("監視開始")
-        self.stop_button = QtWidgets.QPushButton("監視停止")
+        self.start_button = QtWidgets.QPushButton("編集・自動更新 開始")
+        self.stop_button = QtWidgets.QPushButton("編集・自動更新 停止")
         self.start_button.clicked.connect(self.start_monitoring)
         self.stop_button.clicked.connect(self.stop_monitoring)
         self.stop_button.setEnabled(False)
@@ -710,45 +589,9 @@ class TailCodeTATool(QtWidgets.QDialog):
         monitor_layout.addStretch()
         main.addLayout(monitor_layout)
 
-        tweaker_box = QtWidgets.QGroupBox("Tail Tweaker")
-        tweaker_layout = QtWidgets.QGridLayout(tweaker_box)
-        delete_tweaker_button = QtWidgets.QPushButton("選択 Tweaker 削除")
-        delete_tweaker_button.clicked.connect(self.delete_selected_tweakers)
-        bake_tweaker_button = QtWidgets.QPushButton("選択 Tweaker Bake")
-        bake_tweaker_button.clicked.connect(self.bake_selected_tweakers)
-        self.tweaker_status = QtWidgets.QLabel("チェーン登録時に Tweaker を自動作成します。表またはグラフでジョイントを選び、曲がりを調整できます。")
-        self.tweaker_status.setWordWrap(True)
-        tweaker_layout.addWidget(delete_tweaker_button, 0, 0)
-        tweaker_layout.addWidget(bake_tweaker_button, 0, 1)
-        tweaker_layout.addWidget(self.tweaker_status, 1, 0, 1, 2)
-        main.addWidget(tweaker_box)
-
-        scan_box = QtWidgets.QGroupBox("アニメーション範囲評価")
-        scan_layout = QtWidgets.QGridLayout(scan_box)
-        self.start_frame = QtWidgets.QSpinBox()
-        self.end_frame = QtWidgets.QSpinBox()
-        for spin in (self.start_frame, self.end_frame):
-            spin.setRange(-100000, 100000)
-        self.start_frame.setValue(int(cmds.playbackOptions(query=True, minTime=True)))
-        self.end_frame.setValue(int(cmds.playbackOptions(query=True, maxTime=True)))
-        self.scan_progress = QtWidgets.QProgressBar()
-        self.cancel_scan_button = QtWidgets.QPushButton("キャンセル")
-        self.cancel_scan_button.setEnabled(False)
+        # Reason: status is kept internal because the visible Tail Tweaker delete/bake panel was removed.
+        self.tweaker_status = QtWidgets.QLabel()
         self.cancel_scan = False
-        self.cancel_scan_button.clicked.connect(self._cancel_scan)
-        scan_button = QtWidgets.QPushButton("範囲スキャン")
-        scan_button.clicked.connect(self.scan_range)
-        export_button = QtWidgets.QPushButton("CSV書き出し")
-        export_button.clicked.connect(self.export_csv)
-        scan_layout.addWidget(QtWidgets.QLabel("開始"), 0, 0)
-        scan_layout.addWidget(self.start_frame, 0, 1)
-        scan_layout.addWidget(QtWidgets.QLabel("終了"), 0, 2)
-        scan_layout.addWidget(self.end_frame, 0, 3)
-        scan_layout.addWidget(scan_button, 0, 4)
-        scan_layout.addWidget(export_button, 0, 5)
-        scan_layout.addWidget(self.scan_progress, 1, 0, 1, 5)
-        scan_layout.addWidget(self.cancel_scan_button, 1, 5)
-        main.addWidget(scan_box)
 
     def _selected_chain_index(self):
         item = self.chain_list.currentItem()
@@ -921,6 +764,8 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.tweaker_status.setText("チェーン優先順位を更新しました。上にあるチェーンの Tweaker を優先します。")
 
     def begin_graph_undo(self):
+        if not self.is_monitoring:
+            return
         if self.graph_undo_open:
             return
         try:
@@ -944,9 +789,26 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.score_label.setText("曲がりスコア: %.3f    チェーン: %s" % (chain.last_score, chain.label))
         self._fill_angle_table(result["angle_rows"], chain.threshold)
         self.angle_graph.set_angle_rows(result["angle_rows"], chain.threshold)
-        self.heatmap.set_values(result["bend_values"], chain.threshold)
+
+    def _preview_pending_graph_edit(self, row_index, target_bend):
+        if 0 <= row_index < len(self.angle_graph.rows):
+            self.angle_graph.rows[row_index]["bend"] = float(target_bend)
+            self.angle_graph.set_highlight_index(row_index)
+            self.angle_graph.update()
 
     def apply_bend_edit(self, row_index, target_bend):
+        if not self.is_monitoring:
+            chain = self._selected_chain()
+            if chain is None:
+                return
+            if self._pending_graph_edit_label != chain.label:
+                self._pending_graph_edits = {}
+                self._pending_graph_edit_label = chain.label
+            # Reason: stopped mode previews graph edits and defers scene changes into one undoable apply step.
+            self._pending_graph_edits[int(row_index)] = float(target_bend)
+            self._preview_pending_graph_edit(row_index, target_bend)
+            self.tweaker_status.setText("編集・自動更新 開始時にグラフ編集をまとめて反映します。")
+            return
         changed = self._apply_bend_edit(row_index, target_bend, select_target=True)
         if changed:
             self.update_scores_and_display()
@@ -1013,150 +875,6 @@ class TailCodeTATool(QtWidgets.QDialog):
         if max_axis < 0.001:
             return None
         return tuple(v / max_axis for v in direction)
-
-    def _apply_bend_delta_edit(self, row_index, bend_delta, select_target=False):
-        chain = self._selected_chain()
-        if chain is None:
-            return False
-        rows = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)["angle_rows"]
-        if not (0 <= row_index < len(rows)):
-            return False
-        if row_index == 0 or row_index == len(rows) - 1:
-            return False
-
-        row = rows[row_index]
-        direction = self._bend_direction(rows, row_index)
-        if direction is None:
-            return False
-
-        joint = row["joint"]
-        delta = tuple(direction[i] * bend_delta for i in range(3))
-        tweakers = self._tweakers_for_joint(joint)
-        has_incoming = any(_attr_has_incoming_connection("%s.rotate%s" % (joint, axis)) for axis in "XYZ")
-
-        if tweakers:
-            target_node = tweakers[0]
-            current_values = _rotate_values(target_node)
-            self._set_rotate_values(target_node, tuple(current_values[i] + delta[i] for i in range(3)))
-        elif has_incoming:
-            target_node = self._create_tweaker(joint)
-            current_values = _rotate_values(target_node)
-            self._set_rotate_values(target_node, tuple(current_values[i] + delta[i] for i in range(3)))
-        else:
-            target_node = joint
-            current_values = _rotate_values(joint)
-            self._set_rotate_values(joint, tuple(current_values[i] + delta[i] for i in range(3)))
-
-        if select_target:
-            cmds.select(target_node, replace=True)
-        return True
-
-    def match_bend_to_selected(self):
-        self._match_or_align_bend_to_selected(iterations=1, tolerance=0.25, exact=False)
-
-    def align_bend_to_selected(self):
-        self._match_or_align_bend_to_selected(iterations=6, tolerance=0.10, exact=True)
-
-    def _match_or_align_bend_to_selected(self, iterations=1, tolerance=0.25, exact=False):
-        chain = self._selected_chain()
-        if chain is None:
-            cmds.warning("曲がりを揃えるチェーンを選択してください。")
-            return
-        selected_rows = sorted({item.row() for item in self.angle_table.selectedItems()})
-        if not selected_rows:
-            cmds.warning("基準にするジョイント行を選択してください。")
-            return
-
-        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
-        rows = result["angle_rows"]
-        source_index = selected_rows[0]
-        if not (0 < source_index < len(rows) - 1):
-            self.tweaker_status.setText("Root/Tip は基準にできません。Root/Tip 以外のジョイントを選択してください。")
-            return
-
-        target_bend = rows[source_index]["bend"]
-        changed = set()
-        skipped = set()
-        action_name = "TA Tool Align Bend" if exact else "TA Tool Match Bend"
-        cmds.undoInfo(openChunk=True, chunkName=action_name)
-        try:
-            for index in range(1, len(rows) - 1):
-                if index == source_index:
-                    continue
-                adjusted = False
-                for _ in range(max(1, int(iterations))):
-                    current_rows = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)["angle_rows"]
-                    if index >= len(current_rows):
-                        break
-                    current_bend = current_rows[index]["bend"]
-                    if abs(current_bend - target_bend) <= tolerance:
-                        adjusted = True
-                        break
-                    if self._apply_bend_edit(index, target_bend, select_target=False):
-                        adjusted = True
-                    else:
-                        break
-                if adjusted:
-                    changed.add(index)
-                else:
-                    skipped.add(index)
-        finally:
-            cmds.undoInfo(closeChunk=True)
-
-        final_rows = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)["angle_rows"]
-        errors = [abs(final_rows[i]["bend"] - target_bend) for i in changed if i < len(final_rows)]
-        max_error = max(errors) if errors else 0.0
-        self.angle_graph.set_highlight_index(source_index)
-        label = "選択曲がりに揃える" if exact else "選択曲がりに近似"
-        self.tweaker_status.setText(
-            "%s: 基準 %s %.2f 度 / 調整 %d件 / スキップ %d件 / 最大差 %.2f 度"
-            % (label, rows[source_index]["joint"], target_bend, len(changed), len(skipped), max_error)
-        )
-        self.update_scores_and_display()
-
-    def add_bend_delta_to_others(self):
-        chain = self._selected_chain()
-        if chain is None:
-            cmds.warning("曲がり差分を加算するチェーンを選択してください。")
-            return
-        selected_rows = sorted({item.row() for item in self.angle_table.selectedItems()})
-        if not selected_rows:
-            cmds.warning("基準にするジョイント行を選択してください。")
-            return
-
-        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
-        rows = result["angle_rows"]
-        source_index = selected_rows[0]
-        if not (0 < source_index < len(rows) - 1):
-            self.tweaker_status.setText("Root/Tip は曲がり値が取れないため基準にできません。中間ジョイントを選択してください。")
-            return
-
-        target_bend = rows[source_index]["bend"]
-        changed = 0
-        skipped = 0
-        cmds.undoInfo(openChunk=True, chunkName="TA Tool Add Bend Delta")
-        try:
-            for index in range(1, len(rows) - 1):
-                if index == source_index:
-                    continue
-                current_bend = rows[index]["bend"]
-                bend_delta = target_bend - current_bend
-                if abs(bend_delta) < 0.01:
-                    skipped += 1
-                    continue
-                if self._apply_bend_delta_edit(index, bend_delta, select_target=False):
-                    changed += 1
-                else:
-                    skipped += 1
-        finally:
-            cmds.undoInfo(closeChunk=True)
-
-        self.angle_graph.set_highlight_index(source_index)
-        self.tweaker_status.setText(
-            "曲がり差分を加算: 基準 %s %.2f 度 / 調整 %d件 / スキップ %d件"
-            % (rows[source_index]["joint"], target_bend, changed, skipped)
-        )
-        self.update_scores_and_display()
 
     def _set_rotate_values(self, node, values):
         for axis, value in zip("XYZ", values):
@@ -1247,7 +965,6 @@ class TailCodeTATool(QtWidgets.QDialog):
             self._update_display_curve(chain, result["positions"])
         if selected:
             self.refresh_details(selected)
-        self.graph.set_results(self.scan_results, self.threshold_spin.value())
 
     def _display_curve_name(self, chain):
         return "tailCodeTATool_%s_CRV" % _safe_name(chain.label)
@@ -1327,6 +1044,7 @@ class TailCodeTATool(QtWidgets.QDialog):
     def start_monitoring(self):
         try:
             self.stop_monitoring()
+            self._apply_pending_graph_edits()
             self.is_monitoring = True
             self._monitored_joint_paths = set()
             for chain in self.chains:
@@ -1357,11 +1075,16 @@ class TailCodeTATool(QtWidgets.QDialog):
         if self._pending_score_update:
             return
         self._pending_score_update = True
-        # Reason: attribute changes arrive in bursts while rotating; coalesce them into one refresh.
-        QtCore.QTimer.singleShot(40, self._run_pending_scores_update)
+        elapsed_ms = (time.monotonic() - self._last_auto_score_update) * 1000.0
+        delay = max(40, int(self._auto_score_update_interval_ms - elapsed_ms))
+        # Reason: monitored rotate edits can fire continuously; throttle auto refresh while keeping manual refresh immediate.
+        QtCore.QTimer.singleShot(delay, self._run_pending_scores_update)
 
     def _run_pending_scores_update(self):
         self._pending_score_update = False
+        if not self.is_monitoring:
+            return
+        self._last_auto_score_update = time.monotonic()
         self.update_scores_and_display()
 
     def _on_attribute_changed(self, msg, plug, other_plug, client_data):
@@ -1379,9 +1102,32 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.callbacks = []
         self._monitored_joint_paths = set()
         self._pending_score_update = False
+        self._last_auto_score_update = 0.0
         self.is_monitoring = False
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+
+    def _apply_pending_graph_edits(self):
+        if not self._pending_graph_edits:
+            return
+        chain = self._selected_chain()
+        if chain is None or chain.label != self._pending_graph_edit_label:
+            self._pending_graph_edits = {}
+            self._pending_graph_edit_label = ""
+            return
+        edits = sorted(self._pending_graph_edits.items())
+        self._pending_graph_edits = {}
+        self._pending_graph_edit_label = ""
+        changed = False
+        cmds.undoInfo(openChunk=True, chunkName="TA Tool Apply Pending Graph Edits")
+        try:
+            for row_index, target_bend in edits:
+                if self._apply_bend_edit(row_index, target_bend, select_target=False):
+                    changed = True
+        finally:
+            cmds.undoInfo(closeChunk=True)
+        if changed:
+            self.update_scores_and_display()
 
     def restart_monitoring_if_needed(self):
         if self.is_monitoring:
@@ -1653,18 +1399,6 @@ class TailCodeTATool(QtWidgets.QDialog):
             if cmds.objExists(constraint_node) and constraint_node != constraint:
                 cmds.delete(constraint_node)
 
-    def delete_selected_tweakers(self):
-        try:
-            tweakers = self._tweakers_from_selection()
-            if not tweakers:
-                cmds.warning("削除する Tweaker、または対象ジョイントを選択してください。")
-                return
-            self._delete_tweakers(tweakers)
-            self.tweaker_status.setText("削除: %s" % ", ".join(tweakers))
-            self.update_scores_and_display()
-        except Exception:
-            self._show_error("Tweaker 削除に失敗しました")
-
     def _delete_tweakers(self, tweakers):
         for tweaker in tweakers:
             if not cmds.objExists(tweaker):
@@ -1676,38 +1410,6 @@ class TailCodeTATool(QtWidgets.QDialog):
                 self._delete_constraint_tweaker_link(tweaker)
             if cmds.objExists(tweaker):
                 cmds.delete(tweaker)
-
-    def bake_selected_tweakers(self):
-        try:
-            tweakers = self._tweakers_from_selection()
-            if not tweakers:
-                cmds.warning("Bake する Tweaker、または対象ジョイントを選択してください。")
-                return
-            baked = []
-            for tweaker in tweakers:
-                target = _get_string_attr(tweaker, "targetJoint")
-                if not _joint_exists(target):
-                    cmds.warning("対象ジョイントが見つかりません: %s" % target)
-                    continue
-                final_rotate = _rotate_values(target)
-                mode = _get_string_attr(tweaker, "connectionMode", "constraint")
-                if mode == "additiveRotate":
-                    self._disconnect_additive_tweaker(tweaker, keep_final=True)
-                else:
-                    self._delete_constraint_tweaker_link(tweaker)
-                for axis, value in zip("XYZ", final_rotate):
-                    attr = "%s.rotate%s" % (target, axis)
-                    if cmds.objExists(attr) and not cmds.getAttr(attr, lock=True) and not _attr_has_incoming_connection(attr):
-                        cmds.setAttr(attr, value)
-                if cmds.autoKeyframe(query=True, state=True):
-                    cmds.setKeyframe(target, attribute=["rotateX", "rotateY", "rotateZ"])
-                if cmds.objExists(tweaker):
-                    cmds.delete(tweaker)
-                baked.append(target)
-            self.tweaker_status.setText("Bake 完了: %s" % ", ".join(baked))
-            self.update_scores_and_display()
-        except Exception:
-            self._show_error("Tweaker Bake に失敗しました")
 
     def auto_create_tweaker(self):
         try:
@@ -1754,68 +1456,6 @@ class TailCodeTATool(QtWidgets.QDialog):
             )
         except Exception:
             self._show_error("Smart Suggest に失敗しました")
-
-    def scan_range(self):
-        if not self.chains:
-            cmds.warning("登録済みチェーンがありません。")
-            return
-        was_monitoring = self.is_monitoring
-        self.stop_monitoring()
-        self.cancel_scan = False
-        self.cancel_scan_button.setEnabled(True)
-        start = min(self.start_frame.value(), self.end_frame.value())
-        end = max(self.start_frame.value(), self.end_frame.value())
-        current = cmds.currentTime(query=True)
-        frames = list(range(start, end + 1))
-        self.scan_progress.setRange(0, len(frames))
-        results = {chain.label: {} for chain in self.chains if chain.visible}
-        try:
-            for index, frame in enumerate(frames, 1):
-                if self.cancel_scan:
-                    break
-                cmds.currentTime(frame, edit=True)
-                for chain in self.chains:
-                    if chain.visible:
-                        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
-                        results[chain.label][frame] = max(result["bend_values"] or [0.0])
-                self.scan_progress.setValue(index)
-                QtWidgets.QApplication.processEvents()
-            self.scan_results = results
-            max_threshold = max([c.threshold for c in self.chains] or [self.threshold_spin.value()])
-            self.graph.set_results(self.scan_results, max_threshold)
-        except Exception:
-            self._show_error("範囲スキャンに失敗しました")
-        finally:
-            cmds.currentTime(current, edit=True)
-            self.cancel_scan_button.setEnabled(False)
-            if was_monitoring:
-                self.start_monitoring()
-            self.update_scores_and_display()
-
-    def _cancel_scan(self):
-        self.cancel_scan = True
-
-    def goto_frame(self, frame):
-        cmds.currentTime(frame, edit=True)
-        self.update_scores_and_display()
-
-    def export_csv(self):
-        if not self.scan_results:
-            cmds.warning("書き出すスキャン結果がありません。")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "CSV書き出し", "tail_code_ta_bend_scores.csv", "CSV Files (*.csv)")
-        if not path:
-            return
-        frames = sorted({f for scores in self.scan_results.values() for f in scores})
-        labels = list(self.scan_results.keys())
-        try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(["frame"] + labels)
-                for frame in frames:
-                    writer.writerow([frame] + [self.scan_results[label].get(frame, "") for label in labels])
-        except Exception:
-            self._show_error("CSV書き出しに失敗しました")
 
     def closeEvent(self, event):
         self.end_graph_undo()
