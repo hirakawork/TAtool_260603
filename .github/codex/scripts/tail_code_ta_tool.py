@@ -804,7 +804,13 @@ class TailCodeTATool(QtWidgets.QDialog):
                 self.chain_list.addTopLevelItem(item)
                 for joint in chain.joints:
                     tweakers = self._tweakers_for_joint(joint)
-                    suffix = "  ->  %s" % tweakers[0] if tweakers else ""
+                    # Reason: long Tweaker node names make the chain list noisy; keep only a compact status mark.
+                    if len(tweakers) > 1:
+                        suffix = "  [T x%d]" % len(tweakers)
+                    elif tweakers:
+                        suffix = "  [T]"
+                    else:
+                        suffix = ""
                     child = QtWidgets.QTreeWidgetItem(["%s%s" % (joint, suffix)])
                     child.setData(0, QtCore.Qt.UserRole, index)
                     child.setForeground(0, QtGui.QColor(185, 188, 194))
