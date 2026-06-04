@@ -134,6 +134,89 @@ def _angle_degrees(a, b):
     return math.degrees(math.acos(c))
 
 
+def _dominant_translate_axis(joint):
+    if not cmds or not cmds.objExists(joint + ".translate"):
+        return -1, (0.0, 0.0, 0.0)
+    values = cmds.getAttr(joint + ".translate")[0]
+    translate = tuple(float(v) for v in values)
+    axis = max(range(3), key=lambda index: abs(translate[index]))
+    if abs(translate[axis]) <= 1e-8:
+        return -1, (0.0, 0.0, 0.0)
+    sign = -1.0 if translate[axis] < 0.0 else 1.0
+    vector = [0.0, 0.0, 0.0]
+    vector[axis] = sign
+    return axis, tuple(vector)
+
+
+def _world_rotation_quaternion(node):
+    if om is None or not cmds:
+        return None
+    matrix_values = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+    matrix = om.MMatrix(matrix_values)
+    transform = om.MTransformationMatrix(matrix)
+    try:
+        return transform.rotation(asQuaternion=True)
+    except TypeError:
+        rotation = transform.rotation()
+        return rotation.asQuaternion() if hasattr(rotation, "asQuaternion") else rotation
+
+
+def _relative_quaternion(parent, child):
+    parent_quat = _world_rotation_quaternion(parent)
+    child_quat = _world_rotation_quaternion(child)
+    if parent_quat is None or child_quat is None:
+        return None
+    return parent_quat.inverse() * child_quat
+
+
+def _quaternion_angle_degrees(quat):
+    if quat is None:
+        return 0.0
+    try:
+        normalized = quat.normal()
+    except Exception:
+        normalized = quat
+    w = max(-1.0, min(1.0, float(normalized.w)))
+    angle = math.degrees(2.0 * math.acos(w))
+    if angle > 180.0:
+        angle -= 360.0
+    return angle
+
+
+def _swing_twist_degrees(parent, child):
+    axis_index, axis_vector = _dominant_translate_axis(child)
+    if axis_index < 0 or om is None:
+        return 0.0, 0.0, "-"
+    relative = _relative_quaternion(parent, child)
+    if relative is None:
+        return 0.0, 0.0, "-"
+
+    axis = om.MVector(axis_vector)
+    vector = om.MVector(relative.x, relative.y, relative.z)
+    projection = axis * (vector * axis)
+    twist = om.MQuaternion(projection.x, projection.y, projection.z, relative.w)
+    try:
+        twist = twist.normal()
+    except Exception:
+        try:
+            twist.normalizeIt()
+        except Exception:
+            return 0.0, 0.0, "-"
+
+    twist_degrees = _quaternion_angle_degrees(twist)
+    if (vector * axis) < 0.0:
+        twist_degrees = -abs(twist_degrees)
+    else:
+        twist_degrees = abs(twist_degrees)
+
+    try:
+        swing = relative * twist.inverse()
+    except Exception:
+        swing = None
+    swing_degrees = abs(_quaternion_angle_degrees(swing))
+    return swing_degrees, twist_degrees, "XYZ"[axis_index]
+
+
 def _dag_path(node):
     paths = cmds.ls(node, long=True) or []
     return paths[0] if paths else node
@@ -273,7 +356,12 @@ class JointAngleAnalyzer:
                     "joint_orient": orient,
                     "bend": 0.0,
                     "delta": (0.0, 0.0, 0.0),
+                    "signed_delta": (0.0, 0.0, 0.0),
                     "max_delta": 0.0,
+                    "swing": 0.0,
+                    "twist": 0.0,
+                    "twist_abs": 0.0,
+                    "twist_axis": "-",
                 }
             )
 
@@ -288,29 +376,44 @@ class JointAngleAnalyzer:
         for i in range(1, len(rows)):
             prev_rotate = rows[i - 1]["rotate"]
             rotate = rows[i]["rotate"]
-            delta = tuple(abs(rotate[axis] - prev_rotate[axis]) for axis in range(3))
+            signed_delta = tuple(rotate[axis] - prev_rotate[axis] for axis in range(3))
+            delta = tuple(abs(value) for value in signed_delta)
             max_delta = max(delta)
+            swing, twist, twist_axis = _swing_twist_degrees(rows[i - 1]["joint"], rows[i]["joint"])
             rows[i]["delta"] = delta
+            rows[i]["signed_delta"] = signed_delta
             rows[i]["max_delta"] = max_delta
+            rows[i]["swing"] = swing
+            rows[i]["twist"] = twist
+            rows[i]["twist_abs"] = abs(twist)
+            rows[i]["twist_axis"] = twist_axis
             axis_deltas.append(delta)
 
         bend_values = [row["bend"] for row in rows]
+        twist_values = [row["twist_abs"] for row in rows]
         bend_deltas = []
+        twist_problem_joints = []
         for i in range(1, len(rows)):
             delta = abs(rows[i]["bend"] - rows[i - 1]["bend"])
             bend_deltas.append(delta)
             if rows[i]["bend"] > threshold:
                 problem_joints.append(rows[i]["joint"])
+            if rows[i]["twist_abs"] > threshold:
+                twist_problem_joints.append(rows[i]["joint"])
 
         score = sum(max(0.0, bend - threshold) for bend in bend_values)
+        twist_score = sum(max(0.0, twist - threshold) for twist in twist_values)
         return {
             "score": score,
+            "twist_score": twist_score,
             "angle_rows": rows,
             "axis_deltas": axis_deltas,
             "max_deltas": [row["max_delta"] for row in rows],
             "bend_values": bend_values,
+            "twist_values": twist_values,
             "bend_deltas": bend_deltas,
             "problem_joints": problem_joints,
+            "twist_problem_joints": twist_problem_joints,
             "positions": positions,
         }
 
@@ -323,10 +426,13 @@ class BendGraphWidget(QtWidgets.QWidget):
     bendEdited = QtCore.Signal(int, float)
     bendEditFinished = QtCore.Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, value_key="bend", label="曲がり", color=None):
         super().__init__(parent)
         self.rows = []
         self.threshold = 15.0
+        self.value_key = value_key
+        self.label = label
+        self.line_color = color or QtGui.QColor(245, 190, 75)
         self.drag_index = None
         self.highlight_index = None
         self.setMinimumHeight(210)
@@ -353,9 +459,15 @@ class BendGraphWidget(QtWidgets.QWidget):
         return self.rect().adjusted(44, 18, -18, -34)
 
     def _max_value(self):
-        values = [row["bend"] for row in self.rows]
+        values = [self._row_value(row) for row in self.rows]
         max_value = max(values + [self.threshold * 2.0, 1.0])
         return max(50.0, math.ceil(max_value * 1.25 / 10.0) * 10.0)
+
+    def _row_value(self, row):
+        try:
+            return max(0.0, float(row.get(self.value_key, 0.0)))
+        except Exception:
+            return 0.0
 
     def _point(self, index, value):
         plot = self._plot_rect()
@@ -376,7 +488,7 @@ class BendGraphWidget(QtWidgets.QWidget):
         best_index = None
         best_distance = 999999.0
         for index, row in enumerate(self.rows):
-            p = self._point(index, row["bend"])
+            p = self._point(index, self._row_value(row))
             distance = math.hypot(pos.x() - p.x(), pos.y() - p.y())
             if distance < best_distance:
                 best_index = index
@@ -414,10 +526,10 @@ class BendGraphWidget(QtWidgets.QWidget):
 
         if not self.rows:
             painter.setPen(QtGui.QColor(155, 155, 155))
-            painter.drawText(rect, QtCore.Qt.AlignCenter, "曲がりグラフ")
+            painter.drawText(rect, QtCore.Qt.AlignCenter, "%sグラフ" % self.label)
             return
 
-        values = [row["bend"] for row in self.rows]
+        values = [self._row_value(row) for row in self.rows]
         max_value = self._max_value()
 
         threshold_y = plot.bottom() - (self.threshold / max_value) * plot.height()
@@ -431,19 +543,19 @@ class BendGraphWidget(QtWidgets.QWidget):
                 path.moveTo(p)
             else:
                 path.lineTo(p)
-        painter.setPen(QtGui.QPen(QtGui.QColor(245, 190, 75), 2))
+        painter.setPen(QtGui.QPen(self.line_color, 2))
         painter.drawPath(path)
 
         for index, row in enumerate(self.rows):
-            value = row["bend"]
+            value = self._row_value(row)
             p = self._point(index, value)
             if value > self.threshold:
                 painter.setBrush(QtGui.QColor(225, 70, 60))
                 painter.setPen(QtGui.QColor(225, 70, 60))
                 painter.drawEllipse(p, 5, 5)
             else:
-                painter.setBrush(QtGui.QColor(245, 190, 75))
-                painter.setPen(QtGui.QColor(245, 190, 75))
+                painter.setBrush(self.line_color)
+                painter.setPen(self.line_color)
                 painter.drawEllipse(p, 4, 4)
             if index == self.highlight_index:
                 painter.setBrush(QtCore.Qt.NoBrush)
@@ -451,7 +563,7 @@ class BendGraphWidget(QtWidgets.QWidget):
                 painter.drawEllipse(p, 9, 9)
 
         painter.setPen(QtGui.QColor(210, 212, 216))
-        painter.drawText(QtCore.QPointF(plot.left(), rect.bottom() - 13), "曲がり（点を上下ドラッグで調整）")
+        painter.drawText(QtCore.QPointF(plot.left(), rect.bottom() - 13), "%s（点を上下ドラッグで調整）" % self.label)
         painter.setPen(QtGui.QColor(225, 90, 80))
         painter.drawText(QtCore.QPointF(plot.left() + 190, rect.bottom() - 13), "しきい値超え")
 
@@ -603,6 +715,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.threshold_spin.setValue(15.0)
         self.threshold_spin.setDecimals(2)
         self.threshold_spin.setSuffix(" 度（曲がり）")
+        self.threshold_spin.valueChanged.connect(self.on_threshold_changed)
         add_button = QtWidgets.QPushButton("選択チェーンを登録")
         add_button.clicked.connect(self.register_chain)
         update_button = QtWidgets.QPushButton("選択チェーンを更新")
@@ -647,13 +760,26 @@ class TailCodeTATool(QtWidgets.QDialog):
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
         self.score_label = QtWidgets.QLabel("曲がりスコア: -")
-        self.angle_table = QtWidgets.QTableWidget(0, 9)
+        self.angle_table = QtWidgets.QTableWidget(0, 12)
         self.angle_table.setHorizontalHeaderLabels(
-            ["ジョイント", "曲がり", "回転 X", "回転 Y", "回転 Z", "差分 X", "差分 Y", "差分 Z", "最大差"]
+            [
+                "ジョイント",
+                "曲がり",
+                "ねじれ",
+                "ねじれ量",
+                "ねじれ軸",
+                "回転 X",
+                "回転 Y",
+                "回転 Z",
+                "差分 X",
+                "差分 Y",
+                "差分 Z",
+                "最大差",
+            ]
         )
         self.angle_table.horizontalHeader().setStretchLastSection(True)
         self.angle_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for column in range(1, 8):
+        for column in range(1, 11):
             self.angle_table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeToContents)
         self.angle_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.angle_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -666,10 +792,16 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.angle_graph.bendEditStarted.connect(self.begin_graph_undo)
         self.angle_graph.bendEdited.connect(self.apply_bend_edit)
         self.angle_graph.bendEditFinished.connect(self.end_graph_undo)
+        self.twist_graph = BendGraphWidget(value_key="twist_abs", label="ねじれ量", color=QtGui.QColor(100, 205, 210))
+        self.twist_graph.bendEditStarted.connect(self.begin_graph_undo)
+        self.twist_graph.bendEdited.connect(self.apply_twist_edit)
+        self.twist_graph.bendEditFinished.connect(self.end_graph_undo)
         right_layout.addWidget(self.score_label)
         right_layout.addWidget(self.angle_table)
         right_layout.addWidget(QtWidgets.QLabel("現在フレームの曲がり折れ線グラフ"))
         right_layout.addWidget(self.angle_graph)
+        right_layout.addWidget(QtWidgets.QLabel("現在フレームのねじれ量グラフ"))
+        right_layout.addWidget(self.twist_graph)
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 2)
         main.addWidget(splitter, 1)
@@ -694,24 +826,15 @@ class TailCodeTATool(QtWidgets.QDialog):
 
         tweaker_box = QtWidgets.QGroupBox("Tail Tweaker")
         tweaker_layout = QtWidgets.QGridLayout(tweaker_box)
-        create_tweaker_button = QtWidgets.QPushButton("Create Tweaker")
-        create_tweaker_button.clicked.connect(self.create_tweaker_for_selection)
-        auto_tweaker_button = QtWidgets.QPushButton("Auto Tweaker")
-        auto_tweaker_button.clicked.connect(self.auto_create_tweaker)
-        suggest_button = QtWidgets.QPushButton("Smart Suggest")
-        suggest_button.clicked.connect(self.smart_suggest)
         enable_label_button = QtWidgets.QPushButton("ラベル Tweaker ON")
         enable_label_button.clicked.connect(self.enable_selected_label_tweakers)
         disable_label_button = QtWidgets.QPushButton("ラベル Tweaker OFF")
         disable_label_button.clicked.connect(self.disable_selected_label_tweakers)
         self.tweaker_status = QtWidgets.QLabel("選択チェーンの Tail Tweaker を ON/OFF できます。")
         self.tweaker_status.setWordWrap(True)
-        tweaker_layout.addWidget(create_tweaker_button, 0, 0)
-        tweaker_layout.addWidget(auto_tweaker_button, 0, 1)
-        tweaker_layout.addWidget(suggest_button, 0, 2)
-        tweaker_layout.addWidget(enable_label_button, 1, 0)
-        tweaker_layout.addWidget(disable_label_button, 1, 1)
-        tweaker_layout.addWidget(self.tweaker_status, 2, 0, 1, 3)
+        tweaker_layout.addWidget(enable_label_button, 0, 0)
+        tweaker_layout.addWidget(disable_label_button, 0, 1)
+        tweaker_layout.addWidget(self.tweaker_status, 1, 0, 1, 2)
         main.addWidget(tweaker_box)
         self.cancel_scan = False
 
@@ -821,8 +944,12 @@ class TailCodeTATool(QtWidgets.QDialog):
         if chain is None:
             return
         self.label_edit.setText(chain.label)
-        self.joints_edit.setPlainText("\n".join(chain.joints))
-        self.threshold_spin.setValue(chain.threshold)
+        # Keep the joint search/input field under user control when browsing chains.
+        self.threshold_spin.blockSignals(True)
+        try:
+            self.threshold_spin.setValue(chain.threshold)
+        finally:
+            self.threshold_spin.blockSignals(False)
         self.refresh_details(chain)
 
     def refresh_all(self):
@@ -913,61 +1040,100 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.graph_undo_open = False
         self._push_graph_edit_snapshot(before, self._graph_edit_snapshot())
 
+    def on_threshold_changed(self, value):
+        self.apply_threshold_to_selected_chain(value, save=True, refresh=True)
+
+    def apply_threshold_to_selected_chain(self, value, save=True, refresh=True):
+        chain = self._selected_chain()
+        if chain is None:
+            return
+        threshold = float(value)
+        if abs(chain.threshold - threshold) < 0.0001:
+            return
+        chain.threshold = threshold
+        if save:
+            self.save_scene_data()
+        if refresh:
+            self.refresh_details(chain)
+
     def refresh_details(self, chain):
         result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
         chain.last_score = result["score"]
         chain.problem_joints = result["problem_joints"]
-        self.score_label.setText("曲がりスコア: %.3f    チェーン: %s" % (chain.last_score, chain.label))
+        self.score_label.setText(
+            "曲がりスコア: %.3f    ねじれスコア: %.3f    チェーン: %s"
+            % (chain.last_score, result["twist_score"], chain.label)
+        )
         self._fill_angle_table(result["angle_rows"], chain.threshold)
         self.angle_graph.set_angle_rows(result["angle_rows"], chain.threshold)
+        self.twist_graph.set_angle_rows(result["angle_rows"], chain.threshold)
 
-    def _preview_pending_graph_edit(self, row_index, target_bend):
-        if 0 <= row_index < len(self.angle_graph.rows):
-            self.angle_graph.rows[row_index]["bend"] = float(target_bend)
-            self.angle_graph.set_highlight_index(row_index)
-            self.angle_graph.update()
+    def _graph_for_metric(self, metric):
+        return self.twist_graph if metric == "twist" else self.angle_graph
 
-    def _pending_graph_value(self, row_index):
-        if 0 <= row_index < len(self.angle_graph.rows):
-            return float(self.angle_graph.rows[row_index]["bend"])
+    def _graph_value_key(self, metric):
+        return "twist_abs" if metric == "twist" else "bend"
+
+    def _preview_pending_graph_edit(self, metric, row_index, target_value):
+        graph = self._graph_for_metric(metric)
+        value_key = self._graph_value_key(metric)
+        if 0 <= row_index < len(graph.rows):
+            graph.rows[row_index][value_key] = float(target_value)
+            graph.set_highlight_index(row_index)
+            other_graph = self.angle_graph if graph is self.twist_graph else self.twist_graph
+            other_graph.set_highlight_index(row_index)
+            graph.update()
+
+    def _pending_graph_value(self, metric, row_index):
+        graph = self._graph_for_metric(metric)
+        value_key = self._graph_value_key(metric)
+        if 0 <= row_index < len(graph.rows):
+            return float(graph.rows[row_index].get(value_key, 0.0))
         return 0.0
 
     def _finish_pending_graph_drag(self):
         if not self._pending_graph_drag:
             return
-        row_index, start_bend = self._pending_graph_drag
-        end_bend = float(self._pending_graph_edits.get(row_index, self._pending_graph_value(row_index)))
+        metric, row_index, start_value = self._pending_graph_drag
+        key = (metric, row_index)
+        end_value = float(self._pending_graph_edits.get(key, self._pending_graph_value(metric, row_index)))
         self._pending_graph_drag = None
-        if abs(end_bend - start_bend) < 0.001:
+        if abs(end_value - start_value) < 0.001:
             return
         # Reason: one graph drag should become one preview undo step, not many mouse-move steps.
-        self._pending_graph_undo_stack.append((row_index, start_bend, end_bend))
+        self._pending_graph_undo_stack.append((metric, row_index, start_value, end_value))
         self._pending_graph_redo_stack = []
 
-    def _set_pending_graph_edit_value(self, row_index, target_bend):
-        self._pending_graph_edits[int(row_index)] = float(target_bend)
-        self._preview_pending_graph_edit(row_index, target_bend)
+    def _set_pending_graph_edit_value(self, metric, row_index, target_value):
+        self._pending_graph_edits[(metric, int(row_index))] = float(target_value)
+        self._preview_pending_graph_edit(metric, row_index, target_value)
 
     def _undo_pending_graph_edit(self):
         self._finish_pending_graph_drag()
         if not self._pending_graph_undo_stack:
             return False
-        row_index, old_bend, new_bend = self._pending_graph_undo_stack.pop()
-        self._pending_graph_redo_stack.append((row_index, old_bend, new_bend))
-        self._set_pending_graph_edit_value(row_index, old_bend)
+        metric, row_index, old_value, new_value = self._pending_graph_undo_stack.pop()
+        self._pending_graph_redo_stack.append((metric, row_index, old_value, new_value))
+        self._set_pending_graph_edit_value(metric, row_index, old_value)
         self.tweaker_status.setText("停止中グラフ編集をUndoしました。")
         return True
 
     def _redo_pending_graph_edit(self):
         if not self._pending_graph_redo_stack:
             return False
-        row_index, old_bend, new_bend = self._pending_graph_redo_stack.pop()
-        self._pending_graph_undo_stack.append((row_index, old_bend, new_bend))
-        self._set_pending_graph_edit_value(row_index, new_bend)
+        metric, row_index, old_value, new_value = self._pending_graph_redo_stack.pop()
+        self._pending_graph_undo_stack.append((metric, row_index, old_value, new_value))
+        self._set_pending_graph_edit_value(metric, row_index, new_value)
         self.tweaker_status.setText("停止中グラフ編集をRedoしました。")
         return True
 
     def apply_bend_edit(self, row_index, target_bend):
+        self._apply_graph_metric_edit("bend", row_index, target_bend)
+
+    def apply_twist_edit(self, row_index, target_twist):
+        self._apply_graph_metric_edit("twist", row_index, target_twist)
+
+    def _apply_graph_metric_edit(self, metric, row_index, target_value):
         if not self.is_monitoring:
             chain = self._selected_chain()
             if chain is None:
@@ -978,13 +1144,24 @@ class TailCodeTATool(QtWidgets.QDialog):
                 self._pending_graph_undo_stack = []
                 self._pending_graph_redo_stack = []
                 self._pending_graph_edit_label = chain.label
-            if self._pending_graph_drag is None or self._pending_graph_drag[0] != int(row_index):
-                self._pending_graph_drag = (int(row_index), self._pending_graph_value(int(row_index)))
+            if (
+                self._pending_graph_drag is None
+                or self._pending_graph_drag[0] != metric
+                or self._pending_graph_drag[1] != int(row_index)
+            ):
+                self._pending_graph_drag = (
+                    metric,
+                    int(row_index),
+                    self._pending_graph_value(metric, int(row_index)),
+                )
             # Reason: stopped mode previews graph edits and defers scene changes into one undoable apply step.
-            self._set_pending_graph_edit_value(row_index, target_bend)
+            self._set_pending_graph_edit_value(metric, row_index, target_value)
             self.tweaker_status.setText("編集・自動更新 開始時にグラフ編集をまとめて反映します。")
             return
-        changed = self._apply_bend_edit(row_index, target_bend, select_target=True)
+        if metric == "twist":
+            changed = self._apply_twist_edit(row_index, target_value, select_target=True)
+        else:
+            changed = self._apply_bend_edit(row_index, target_value, select_target=True)
         if changed:
             self.update_scores_and_display()
 
@@ -1008,12 +1185,17 @@ class TailCodeTATool(QtWidgets.QDialog):
             return False
 
         rotate = row["rotate"]
-        direction = rotate
+        twist_axis = row.get("twist_axis", "-")
+        excluded_axis_index = "XYZ".index(twist_axis) if twist_axis in "XYZ" else -1
+        direction = list(rotate)
+        if excluded_axis_index >= 0:
+            direction[excluded_axis_index] = 0.0
         if max(abs(v) for v in direction) < 0.001 and row_index > 0:
-            prev_rotate = rows[row_index - 1]["rotate"]
-            direction = tuple(rotate[i] - prev_rotate[i] for i in range(3))
+            direction = list(row["signed_delta"])
+            if excluded_axis_index >= 0:
+                direction[excluded_axis_index] = 0.0
         if max(abs(v) for v in direction) < 0.001:
-            self.tweaker_status.setText("XYZ 比率を保つための回転方向がありません。先に少し回転を付けてください。")
+            self.tweaker_status.setText("ねじれ軸を除いた曲がり方向がありません。先に曲がり側の軸へ少し回転を付けてください。")
             return False
 
         delta = tuple(direction[i] * (ratio - 1.0) for i in range(3))
@@ -1029,14 +1211,70 @@ class TailCodeTATool(QtWidgets.QDialog):
             target_node = self._create_tweaker(joint)
             self._set_rotate_values(target_node, delta)
         else:
-            new_values = tuple(rotate[i] * ratio for i in range(3))
+            new_values = tuple(rotate[i] + delta[i] for i in range(3))
             self._set_rotate_values(joint, new_values)
             target_node = joint
 
         if select_target:
             cmds.select(target_node, replace=True)
+        axis_note = " / ねじれ軸 %s は固定" % twist_axis if twist_axis in "XYZ" else ""
         self.tweaker_status.setText(
-            "曲がり調整: %s  %.2f -> %.2f / XYZ 比率維持" % (joint, row["bend"], target_bend)
+            "曲がり調整: %s  %.2f -> %.2f / 曲がり軸のみ%s" % (joint, row["bend"], target_bend, axis_note)
+        )
+        return True
+
+    def _apply_twist_edit(self, row_index, target_twist, select_target=False):
+        chain = self._selected_chain()
+        if chain is None:
+            return False
+        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+        rows = result["angle_rows"]
+        if not (0 <= row_index < len(rows)):
+            return False
+        if row_index == 0:
+            self.tweaker_status.setText("Root は親との差分がないためねじれ調整できません。")
+            return False
+
+        row = rows[row_index]
+        joint = row["joint"]
+        axis = row.get("twist_axis", "-")
+        if axis not in "XYZ":
+            self.tweaker_status.setText("ねじれ軸を判定できません。先に少し回転差を付けてください。")
+            return False
+        current_twist = float(row.get("twist", 0.0))
+        current_abs = abs(current_twist)
+        target_abs = max(0.0, float(target_twist))
+        sign = -1.0 if current_twist < 0.0 else 1.0
+        desired_twist = target_abs * sign
+        delta_value = desired_twist - current_twist
+        if abs(delta_value) < 0.005:
+            return False
+
+        tweakers = self._tweakers_for_joint(joint)
+        has_incoming = any(_attr_has_incoming_connection("%s.rotate%s" % (joint, check_axis)) for check_axis in "XYZ")
+
+        if tweakers:
+            target_node = tweakers[0]
+            current_tweaker_rotate = _rotate_values(target_node)
+            values = list(current_tweaker_rotate)
+            values["XYZ".index(axis)] += delta_value
+            self._set_rotate_values(target_node, tuple(values))
+        elif has_incoming:
+            target_node = self._create_tweaker(joint)
+            values = [0.0, 0.0, 0.0]
+            values["XYZ".index(axis)] = delta_value
+            self._set_rotate_values(target_node, tuple(values))
+        else:
+            rotate = list(row["rotate"])
+            rotate["XYZ".index(axis)] += delta_value
+            self._set_rotate_values(joint, tuple(rotate))
+            target_node = joint
+
+        if select_target:
+            cmds.select(target_node, replace=True)
+        self.tweaker_status.setText(
+            "ねじれ調整: %s  %s %.2f -> %.2f"
+            % (joint, axis, current_abs, target_abs)
         )
         return True
 
@@ -1069,12 +1307,14 @@ class TailCodeTATool(QtWidgets.QDialog):
         selected_rows = sorted({item.row() for item in self.angle_table.selectedItems()})
         if not selected_rows:
             self.angle_graph.set_highlight_index(None)
+            self.twist_graph.set_highlight_index(None)
             return
         self._select_joint_from_angle_table_row(selected_rows[0])
 
     def _select_joint_from_angle_table_row(self, row_index):
         if row_index < 0 or row_index >= self.angle_table.rowCount():
             self.angle_graph.set_highlight_index(None)
+            self.twist_graph.set_highlight_index(None)
             return
 
         item = self.angle_table.item(row_index, 0)
@@ -1084,6 +1324,7 @@ class TailCodeTATool(QtWidgets.QDialog):
             joint = chain.joints[row_index] if chain and 0 <= row_index < len(chain.joints) else ""
 
         self.angle_graph.set_highlight_index(row_index)
+        self.twist_graph.set_highlight_index(row_index)
         if not _joint_exists(joint):
             self.tweaker_status.setText("ジョイントが見つかりません: %s" % joint)
             return
@@ -1114,6 +1355,9 @@ class TailCodeTATool(QtWidgets.QDialog):
             values = [
                 row["joint"],
                 "%.2f" % row["bend"],
+                "%.2f" % row["twist"],
+                "%.2f" % row["twist_abs"],
+                row["twist_axis"],
                 "%.2f" % row["rotate"][0],
                 "%.2f" % row["rotate"][1],
                 "%.2f" % row["rotate"][2],
@@ -1303,9 +1547,12 @@ class TailCodeTATool(QtWidgets.QDialog):
             return
         before = self._graph_edit_snapshot()
         changed = False
-        for row_index, target_bend in edits:
-            if self._apply_bend_edit(row_index, target_bend, select_target=False):
-                changed = True
+        for key, target_value in edits:
+            metric, row_index = key
+            if metric == "twist":
+                changed = self._apply_twist_edit(row_index, target_value, select_target=False) or changed
+            else:
+                changed = self._apply_bend_edit(row_index, target_value, select_target=False) or changed
 
         after = self._graph_edit_snapshot()
         self._clear_pending_graph_edits()
