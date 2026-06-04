@@ -151,6 +151,22 @@ def _add_bool_attr(node, attr, value=True):
     cmds.setAttr("%s.%s" % (node, attr), bool(value))
 
 
+def _add_float_attr(node, attr, value=0.0, min_value=None, max_value=None, keyable=True):
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        kwargs = {
+            "longName": attr,
+            "attributeType": "double",
+            "defaultValue": float(value),
+            "keyable": keyable,
+        }
+        if min_value is not None:
+            kwargs["minValue"] = float(min_value)
+        if max_value is not None:
+            kwargs["maxValue"] = float(max_value)
+        cmds.addAttr(node, **kwargs)
+    cmds.setAttr("%s.%s" % (node, attr), float(value))
+
+
 def _get_string_attr(node, attr, default=""):
     if not cmds.objExists(node) or not cmds.attributeQuery(attr, node=node, exists=True):
         return default
@@ -608,11 +624,15 @@ class TailCodeTATool(QtWidgets.QDialog):
         left = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left)
         self.chain_list = QtWidgets.QTreeWidget()
-        self.chain_list.setHeaderLabels(["登録済みチェーン / ジョイント"])
+        self.chain_list.setColumnCount(2)
+        self.chain_list.setHeaderLabels(["登録済みチェーン / ジョイント", "Tweaker"])
+        self.chain_list.header().setStretchLastSection(False)
+        self.chain_list.header().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.chain_list.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         self.chain_list.setRootIsDecorated(True)
         self.chain_list.currentItemChanged.connect(self.on_chain_selected)
         self.chain_list.itemChanged.connect(self._visibility_changed)
-        left_layout.addWidget(QtWidgets.QLabel("登録済みチェーン（上ほど優先）"))
+        left_layout.addWidget(QtWidgets.QLabel("登録済みチェーン（右列でTweaker状態を確認）"))
         left_layout.addWidget(self.chain_list)
         priority_layout = QtWidgets.QHBoxLayout()
         up_button = QtWidgets.QPushButton("上へ")
@@ -672,8 +692,27 @@ class TailCodeTATool(QtWidgets.QDialog):
         monitor_layout.addStretch()
         main.addLayout(monitor_layout)
 
-        # Reason: status is kept internal because the visible Tail Tweaker delete/bake panel was removed.
-        self.tweaker_status = QtWidgets.QLabel()
+        tweaker_box = QtWidgets.QGroupBox("Tail Tweaker")
+        tweaker_layout = QtWidgets.QGridLayout(tweaker_box)
+        create_tweaker_button = QtWidgets.QPushButton("Create Tweaker")
+        create_tweaker_button.clicked.connect(self.create_tweaker_for_selection)
+        auto_tweaker_button = QtWidgets.QPushButton("Auto Tweaker")
+        auto_tweaker_button.clicked.connect(self.auto_create_tweaker)
+        suggest_button = QtWidgets.QPushButton("Smart Suggest")
+        suggest_button.clicked.connect(self.smart_suggest)
+        enable_label_button = QtWidgets.QPushButton("ラベル Tweaker ON")
+        enable_label_button.clicked.connect(self.enable_selected_label_tweakers)
+        disable_label_button = QtWidgets.QPushButton("ラベル Tweaker OFF")
+        disable_label_button.clicked.connect(self.disable_selected_label_tweakers)
+        self.tweaker_status = QtWidgets.QLabel("選択チェーンの Tail Tweaker を ON/OFF できます。")
+        self.tweaker_status.setWordWrap(True)
+        tweaker_layout.addWidget(create_tweaker_button, 0, 0)
+        tweaker_layout.addWidget(auto_tweaker_button, 0, 1)
+        tweaker_layout.addWidget(suggest_button, 0, 2)
+        tweaker_layout.addWidget(enable_label_button, 1, 0)
+        tweaker_layout.addWidget(disable_label_button, 1, 1)
+        tweaker_layout.addWidget(self.tweaker_status, 2, 0, 1, 3)
+        main.addWidget(tweaker_box)
         self.cancel_scan = False
 
     def _selected_chain_index(self):
@@ -795,25 +834,26 @@ class TailCodeTATool(QtWidgets.QDialog):
         try:
             for index, chain in enumerate(self.chains):
                 label = "%02d  %s" % (index + 1, chain.label)
-                item = QtWidgets.QTreeWidgetItem([label])
+                state_label, state_color = self._label_tweaker_state(chain.label)
+                item = QtWidgets.QTreeWidgetItem([label, state_label])
                 item.setData(0, QtCore.Qt.UserRole, index)
                 item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
                 item.setCheckState(0, QtCore.Qt.Checked if chain.visible else QtCore.Qt.Unchecked)
                 color = QtGui.QColor.fromRgbF(*COLORS[chain.color_index % len(COLORS)])
                 item.setForeground(0, color)
+                item.setForeground(1, state_color)
                 self.chain_list.addTopLevelItem(item)
                 for joint in chain.joints:
-                    tweakers = self._tweakers_for_joint(joint)
-                    # Reason: long Tweaker node names make the chain list noisy; keep only a compact status mark.
-                    if len(tweakers) > 1:
-                        suffix = "  [T x%d]" % len(tweakers)
-                    elif tweakers:
-                        suffix = "  [T]"
-                    else:
-                        suffix = ""
-                    child = QtWidgets.QTreeWidgetItem(["%s%s" % (joint, suffix)])
+                    tweaker = self._tweaker_for_joint_and_label(joint, chain.label)
+                    other_count = max(0, len(self._tweakers_for_joint(joint)) - (1 if tweaker else 0))
+                    suffix = "  [T]" if tweaker else ""
+                    if other_count:
+                        suffix += " [+%d]" % other_count
+                    child_state = self._tweaker_state_label(tweaker) if tweaker else "なし"
+                    child = QtWidgets.QTreeWidgetItem(["%s%s" % (joint, suffix), child_state])
                     child.setData(0, QtCore.Qt.UserRole, index)
                     child.setForeground(0, QtGui.QColor(185, 188, 194))
+                    child.setForeground(1, self._state_color(child_state))
                     item.addChild(child)
                 item.setExpanded(True)
         finally:
@@ -1360,6 +1400,204 @@ class TailCodeTATool(QtWidgets.QDialog):
             if cmds.objExists(attr):
                 cmds.setAttr(attr, new_label, type="string")
 
+    def _tweakers_for_label(self, label):
+        return [tweaker for tweaker in self._all_tweakers() if _get_string_attr(tweaker, "ownerChainLabel") == label]
+
+    def _disconnect_attr_if_connected(self, source, destination):
+        if source and destination and cmds.objExists(source) and cmds.objExists(destination):
+            try:
+                if cmds.isConnected(source, destination):
+                    cmds.disconnectAttr(source, destination)
+            except Exception:
+                pass
+
+    def _connect_attr_if_possible(self, source, destination):
+        if source and destination and cmds.objExists(source) and cmds.objExists(destination):
+            try:
+                if not cmds.isConnected(source, destination):
+                    cmds.connectAttr(source, destination, force=True)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _ensure_tweaker_enable_attr(self, tweaker, enabled=True):
+        _add_float_attr(tweaker, "enableWeight", 1.0 if enabled else 0.0, min_value=0.0, max_value=1.0)
+        _add_bool_attr(tweaker, "tailTweakerEnabled", bool(enabled))
+
+    def _tweaker_is_enabled(self, tweaker):
+        if not tweaker or not cmds.objExists(tweaker):
+            return False
+        if cmds.attributeQuery("enableWeight", node=tweaker, exists=True):
+            try:
+                return float(cmds.getAttr(tweaker + ".enableWeight")) > 0.5
+            except Exception:
+                pass
+        if cmds.attributeQuery("tailTweakerEnabled", node=tweaker, exists=True):
+            try:
+                return bool(cmds.getAttr(tweaker + ".tailTweakerEnabled"))
+            except Exception:
+                pass
+        return True
+
+    def _tweaker_state_label(self, tweaker):
+        return "ON" if self._tweaker_is_enabled(tweaker) else "OFF"
+
+    def _state_color(self, state):
+        if state == "ON":
+            return QtGui.QColor(95, 210, 130)
+        if state == "OFF":
+            return QtGui.QColor(230, 105, 95)
+        if state == "MIX":
+            return QtGui.QColor(235, 190, 80)
+        return QtGui.QColor(150, 150, 150)
+
+    def _label_tweaker_state(self, label):
+        tweakers = self._tweakers_for_label(label)
+        if not tweakers:
+            return "なし", self._state_color("なし")
+        enabled_count = sum(1 for tweaker in tweakers if self._tweaker_is_enabled(tweaker))
+        if enabled_count == len(tweakers):
+            return "ON", self._state_color("ON")
+        if enabled_count == 0:
+            return "OFF", self._state_color("OFF")
+        return "MIX", self._state_color("MIX")
+
+    def _ensure_additive_weight_network(self, tweaker, target, axis):
+        target_attr = "%s.rotate%s" % (target, axis)
+        tweaker_attr = "%s.rotate%s" % (tweaker, axis)
+        plus = _get_string_attr(tweaker, "addNode%s" % axis)
+        if not plus or not cmds.objExists(plus) or not cmds.objExists(target_attr):
+            return ""
+
+        source_attr = _get_string_attr(tweaker, "sourceRotate%s" % axis)
+        base_attr = "%s.input1D[0]" % plus
+        add_attr = "%s.input1D[1]" % plus
+        output_attr = "%s.output1D" % plus
+        mult = _get_string_attr(tweaker, "enableNode%s" % axis)
+        if not mult or not cmds.objExists(mult):
+            mult = cmds.createNode("multDoubleLinear", name="%s_enable%s_MDL" % (tweaker, axis))
+            _add_string_attr(tweaker, "enableNode%s" % axis, mult)
+
+        if source_attr:
+            self._disconnect_attr_if_connected(source_attr, target_attr)
+            base_sources = cmds.listConnections(base_attr, source=True, destination=False, plugs=True) or []
+            for src in base_sources:
+                if src != source_attr:
+                    self._disconnect_attr_if_connected(src, base_attr)
+            self._connect_attr_if_possible(source_attr, base_attr)
+        elif not (cmds.listConnections(base_attr, source=True, destination=False, plugs=True) or []):
+            try:
+                cmds.setAttr(base_attr, float(_get_string_attr(tweaker, "baseRotate%s" % axis, "0")))
+            except Exception:
+                pass
+
+        add_sources = cmds.listConnections(add_attr, source=True, destination=False, plugs=True) or []
+        for src in add_sources:
+            if src != "%s.output" % mult:
+                self._disconnect_attr_if_connected(src, add_attr)
+        self._connect_attr_if_possible(tweaker_attr, "%s.input1" % mult)
+        self._connect_attr_if_possible("%s.enableWeight" % tweaker, "%s.input2" % mult)
+        self._connect_attr_if_possible("%s.output" % mult, add_attr)
+        self._connect_attr_if_possible(output_attr, target_attr)
+        return mult
+
+    def _set_additive_tweaker_enabled(self, tweaker, enabled):
+        target = _get_string_attr(tweaker, "targetJoint")
+        if not _joint_exists(target):
+            return
+        self._ensure_tweaker_enable_attr(tweaker, enabled)
+        for axis in "XYZ":
+            self._ensure_additive_weight_network(tweaker, target, axis)
+        cmds.setAttr("%s.enableWeight" % tweaker, 1.0 if enabled else 0.0)
+        cmds.setAttr("%s.tailTweakerEnabled" % tweaker, bool(enabled))
+
+    def _constraint_has_tweaker_target(self, constraint, tweaker):
+        if not constraint or not cmds.objExists(constraint):
+            return False
+        try:
+            targets = cmds.orientConstraint(constraint, query=True, targetList=True) or []
+        except Exception:
+            return False
+        tweaker_long = _dag_path(tweaker)
+        for target in targets:
+            target_long = _dag_path(target) if cmds.objExists(target) else target
+            if target == tweaker or target == tweaker_long or target_long == tweaker_long:
+                return True
+        return False
+
+    def _set_constraint_tweaker_weight(self, constraint, tweaker, value):
+        try:
+            targets = cmds.orientConstraint(constraint, query=True, targetList=True) or []
+            weights = cmds.orientConstraint(constraint, query=True, weightAliasList=True) or []
+        except Exception:
+            return
+        tweaker_long = _dag_path(tweaker)
+        for target, weight in zip(targets, weights):
+            target_long = _dag_path(target) if cmds.objExists(target) else target
+            if target == tweaker or target == tweaker_long or target_long == tweaker_long:
+                attr = "%s.%s" % (constraint, weight)
+                if cmds.objExists(attr):
+                    cmds.setAttr(attr, float(value))
+
+    def _set_constraint_tweaker_enabled(self, tweaker, enabled):
+        target = _get_string_attr(tweaker, "targetJoint")
+        if not _joint_exists(target):
+            return
+        self._ensure_tweaker_enable_attr(tweaker, enabled)
+        constraint = _get_string_attr(tweaker, "constraintNode")
+        if not constraint or not cmds.objExists(constraint):
+            try:
+                constraint = cmds.orientConstraint(tweaker, target, maintainOffset=True, name=tweaker + "_orientConstraint")[0]
+                _add_string_attr(tweaker, "constraintNode", constraint)
+                _add_bool_attr(tweaker, "usesExistingConstraint", False)
+            except Exception as exc:
+                cmds.warning("Tweaker constraint を再接続できませんでした: %s / %s" % (tweaker, exc))
+                return
+        elif not self._constraint_has_tweaker_target(constraint, tweaker):
+            try:
+                cmds.orientConstraint(tweaker, target, edit=True, maintainOffset=True, weight=1.0)
+            except Exception:
+                pass
+        self._set_constraint_tweaker_weight(constraint, tweaker, 1.0 if enabled else 0.0)
+        cmds.setAttr("%s.enableWeight" % tweaker, 1.0 if enabled else 0.0)
+        cmds.setAttr("%s.tailTweakerEnabled" % tweaker, bool(enabled))
+
+    def _set_tweaker_enabled(self, tweaker, enabled):
+        if not cmds.objExists(tweaker):
+            return
+        mode = _get_string_attr(tweaker, "connectionMode", "constraint")
+        if mode == "additiveRotate":
+            self._set_additive_tweaker_enabled(tweaker, enabled)
+        else:
+            self._set_constraint_tweaker_enabled(tweaker, enabled)
+
+    def _set_selected_label_tweakers_enabled(self, enabled):
+        chain = self._selected_chain()
+        if chain is None:
+            cmds.warning("対象ラベルのチェーンを選択してください。")
+            return
+        tweakers = self._tweakers_for_label(chain.label)
+        if not tweakers:
+            cmds.warning("ラベルに紐づく Tweaker がありません: %s" % chain.label)
+            return
+        cmds.undoInfo(openChunk=True, chunkName="TA Tool Label Tweaker %s" % ("ON" if enabled else "OFF"))
+        try:
+            for tweaker in tweakers:
+                self._set_tweaker_enabled(tweaker, enabled)
+        finally:
+            cmds.undoInfo(closeChunk=True)
+        self.tweaker_status.setText(
+            "ラベル Tweaker %s: %s / %d件" % ("ON" if enabled else "OFF", chain.label, len(tweakers))
+        )
+        self.refresh_all()
+
+    def enable_selected_label_tweakers(self):
+        self._set_selected_label_tweakers_enabled(True)
+
+    def disable_selected_label_tweakers(self):
+        self._set_selected_label_tweakers_enabled(False)
+
     def _selected_tweaker_targets(self):
         joints = cmds.ls(selection=True, type="joint") or []
         if joints:
@@ -1452,6 +1690,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         _add_bool_attr(tweaker, "tailTweaker", True)
         _add_string_attr(tweaker, "targetJoint", _dag_path(joint))
         _add_string_attr(tweaker, "ownerChainLabel", owner_label or "")
+        self._ensure_tweaker_enable_attr(tweaker, True)
 
         rotate_attrs = ["%s.rotate%s" % (joint, axis) for axis in "XYZ"]
         if any(_attr_has_incoming_connection(attr) for attr in rotate_attrs):
@@ -1472,6 +1711,7 @@ class TailCodeTATool(QtWidgets.QDialog):
                 _add_bool_attr(tweaker, "usesExistingConstraint", False)
             _add_string_attr(tweaker, "constraintNode", constraint)
             _add_string_attr(tweaker, "connectionMode", "constraint")
+        self._set_tweaker_enabled(tweaker, True)
         return tweaker
 
     def _connect_additive_tweaker(self, tweaker, joint):
@@ -1524,6 +1764,9 @@ class TailCodeTATool(QtWidgets.QDialog):
                     pass
             if plus and cmds.objExists(plus):
                 cmds.delete(plus)
+            mult = _get_string_attr(tweaker, "enableNode%s" % axis)
+            if mult and cmds.objExists(mult):
+                cmds.delete(mult)
 
     def _delete_constraint_tweaker_link(self, tweaker):
         constraint = _get_string_attr(tweaker, "constraintNode")
