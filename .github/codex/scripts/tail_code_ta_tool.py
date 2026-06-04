@@ -559,6 +559,9 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.chains = []
         self.callbacks = []
         self.is_monitoring = False
+        self._monitored_joint_paths = set()
+        self._pending_score_update = False
+        self._tweaker_scan_cache = None
         self.scan_results = {}
         self.graph_undo_open = False
         self._build_ui()
@@ -861,24 +864,29 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.chain_list.blockSignals(True)
         current = self._selected_chain_index()
         self.chain_list.clear()
-        for index, chain in enumerate(self.chains):
-            label = "%02d  %s" % (index + 1, chain.label)
-            item = QtWidgets.QTreeWidgetItem([label])
-            item.setData(0, QtCore.Qt.UserRole, index)
-            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(0, QtCore.Qt.Checked if chain.visible else QtCore.Qt.Unchecked)
-            color = QtGui.QColor.fromRgbF(*COLORS[chain.color_index % len(COLORS)])
-            item.setForeground(0, color)
-            self.chain_list.addTopLevelItem(item)
-            for joint in chain.joints:
-                tweakers = self._tweakers_for_joint(joint)
-                suffix = "  ->  %s" % tweakers[0] if tweakers else ""
-                child = QtWidgets.QTreeWidgetItem(["%s%s" % (joint, suffix)])
-                child.setData(0, QtCore.Qt.UserRole, index)
-                child.setForeground(0, QtGui.QColor(185, 188, 194))
-                item.addChild(child)
-            item.setExpanded(True)
-        self.chain_list.blockSignals(False)
+        # Reason: tree rebuild asks for tweakers per joint; cache one scene scan for this refresh only.
+        self._tweaker_scan_cache = self._scan_all_tweakers()
+        try:
+            for index, chain in enumerate(self.chains):
+                label = "%02d  %s" % (index + 1, chain.label)
+                item = QtWidgets.QTreeWidgetItem([label])
+                item.setData(0, QtCore.Qt.UserRole, index)
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                item.setCheckState(0, QtCore.Qt.Checked if chain.visible else QtCore.Qt.Unchecked)
+                color = QtGui.QColor.fromRgbF(*COLORS[chain.color_index % len(COLORS)])
+                item.setForeground(0, color)
+                self.chain_list.addTopLevelItem(item)
+                for joint in chain.joints:
+                    tweakers = self._tweakers_for_joint(joint)
+                    suffix = "  ->  %s" % tweakers[0] if tweakers else ""
+                    child = QtWidgets.QTreeWidgetItem(["%s%s" % (joint, suffix)])
+                    child.setData(0, QtCore.Qt.UserRole, index)
+                    child.setForeground(0, QtGui.QColor(185, 188, 194))
+                    item.addChild(child)
+                item.setExpanded(True)
+        finally:
+            self._tweaker_scan_cache = None
+            self.chain_list.blockSignals(False)
         if self.chains:
             index = max(0, min(current, len(self.chains) - 1))
             self.chain_list.setCurrentItem(self.chain_list.topLevelItem(index))
@@ -1255,27 +1263,50 @@ class TailCodeTATool(QtWidgets.QDialog):
         if cmds.objExists(name):
             cmds.delete(name)
 
-    def _update_display_curve(self, chain, positions):
-        name = self._display_curve_name(chain)
-        if len(positions) < 2:
-            self._delete_display_curve(chain)
-            return
-        self._ensure_display_group()
-        if cmds.objExists(name):
-            cmds.delete(name)
-        degree = 1 if len(positions) < 4 else 3
-        curve = cmds.curve(name=name, degree=degree, point=positions)
-        cmds.parent(curve, DISPLAY_GROUP)
-        shape = cmds.listRelatives(curve, shapes=True, fullPath=True) or []
+    def _display_curve_shape(self, curve):
+        shapes = cmds.listRelatives(curve, shapes=True, fullPath=True) or []
+        return shapes[0] if shapes else ""
+
+    def _display_curve_can_reuse(self, curve, degree, positions):
+        shape = self._display_curve_shape(curve)
+        if not shape:
+            return False
+        cvs = cmds.ls("%s.cv[*]" % curve, flatten=True) or []
+        if len(cvs) != len(positions):
+            return False
+        if cmds.objExists(shape + ".degree") and int(cmds.getAttr(shape + ".degree")) != degree:
+            return False
+        return True
+
+    def _style_display_curve(self, curve, chain):
+        shape = self._display_curve_shape(curve)
         color = COLORS[chain.color_index % len(COLORS)]
         if shape:
-            shape = shape[0]
             cmds.setAttr(shape + ".overrideEnabled", 1)
             cmds.setAttr(shape + ".overrideRGBColors", 1)
             cmds.setAttr(shape + ".overrideColorRGB", color[0], color[1], color[2])
             if cmds.objExists(shape + ".lineWidth"):
                 cmds.setAttr(shape + ".lineWidth", 3)
         cmds.setAttr(curve + ".template", 1)
+
+    def _update_display_curve(self, chain, positions):
+        name = self._display_curve_name(chain)
+        if len(positions) < 2:
+            self._delete_display_curve(chain)
+            return
+        self._ensure_display_group()
+        degree = 1 if len(positions) < 4 else 3
+        if cmds.objExists(name) and self._display_curve_can_reuse(name, degree, positions):
+            # Reason: updating CVs avoids Maya delete/create churn during interactive rotation.
+            for index, position in enumerate(positions):
+                cmds.xform("%s.cv[%d]" % (name, index), worldSpace=True, translation=position)
+            self._style_display_curve(name, chain)
+            return
+        if cmds.objExists(name):
+            cmds.delete(name)
+        curve = cmds.curve(name=name, degree=degree, point=positions)
+        cmds.parent(curve, DISPLAY_GROUP)
+        self._style_display_curve(curve, chain)
 
     def save_scene_data(self):
         node = _ensure_data_node()
@@ -1297,6 +1328,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         try:
             self.stop_monitoring()
             self.is_monitoring = True
+            self._monitored_joint_paths = set()
             for chain in self.chains:
                 self._register_callbacks_for_chain(chain)
             self.start_button.setEnabled(False)
@@ -1310,16 +1342,32 @@ class TailCodeTATool(QtWidgets.QDialog):
         for joint in chain.joints:
             if not _joint_exists(joint):
                 continue
+            joint_path = _dag_path(joint)
+            # Reason: overlapping chains can share joints; one callback per joint is enough.
+            if joint_path in self._monitored_joint_paths:
+                continue
+            self._monitored_joint_paths.add(joint_path)
             sel = om.MSelectionList()
             sel.add(joint)
             obj = sel.getDependNode(0)
             cb = om.MNodeMessage.addAttributeChangedCallback(obj, self._on_attribute_changed)
             self.callbacks.append(cb)
 
+    def _request_scores_update(self):
+        if self._pending_score_update:
+            return
+        self._pending_score_update = True
+        # Reason: attribute changes arrive in bursts while rotating; coalesce them into one refresh.
+        QtCore.QTimer.singleShot(40, self._run_pending_scores_update)
+
+    def _run_pending_scores_update(self):
+        self._pending_score_update = False
+        self.update_scores_and_display()
+
     def _on_attribute_changed(self, msg, plug, other_plug, client_data):
         if not (msg & om.MNodeMessage.kAttributeSet):
             return
-        QtCore.QTimer.singleShot(0, self.update_scores_and_display)
+        self._request_scores_update()
 
     def stop_monitoring(self):
         if self.callbacks and om is not None:
@@ -1329,6 +1377,8 @@ class TailCodeTATool(QtWidgets.QDialog):
                 except Exception:
                     pass
         self.callbacks = []
+        self._monitored_joint_paths = set()
+        self._pending_score_update = False
         self.is_monitoring = False
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -1350,9 +1400,14 @@ class TailCodeTATool(QtWidgets.QDialog):
             return "%s%s_%s" % (TWEAKER_PREFIX, _safe_name(owner_label), joint_name)
         return TWEAKER_PREFIX + joint_name
 
-    def _all_tweakers(self):
+    def _scan_all_tweakers(self):
         transforms = cmds.ls(type="transform") or []
         return [node for node in transforms if _is_tweaker(node)]
+
+    def _all_tweakers(self):
+        if self._tweaker_scan_cache is not None:
+            return list(self._tweaker_scan_cache)
+        return self._scan_all_tweakers()
 
     def _tweakers_from_selection(self):
         selected = cmds.ls(selection=True, long=False) or []
