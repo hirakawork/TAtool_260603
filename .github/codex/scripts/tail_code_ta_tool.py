@@ -461,6 +461,12 @@ class TailCodeTATool(QtWidgets.QDialog):
         self._tweaker_scan_cache = None
         self._pending_graph_edits = {}
         self._pending_graph_edit_label = ""
+        self._pending_graph_drag = None
+        self._pending_graph_undo_stack = []
+        self._pending_graph_redo_stack = []
+        self._graph_edit_undo_stack = []
+        self._graph_edit_redo_stack = []
+        self._live_graph_drag_snapshot = None
         self.graph_undo_open = False
         self._build_ui()
         self._install_undo_redo_shortcuts()
@@ -481,21 +487,91 @@ class TailCodeTATool(QtWidgets.QDialog):
         redo_y_shortcut.activated.connect(self._maya_redo)
 
     def _maya_undo(self):
-        self.end_graph_undo()
+        if self.undo_graph_edit():
+            return
         try:
             cmds.undo()
             self.update_scores_and_display()
         except Exception as exc:
-            self.tweaker_status.setText("Undo できません: %s" % exc)
+            self.tweaker_status.setText("Undo failed: %s" % exc)
 
     def _maya_redo(self):
-        self.end_graph_undo()
+        if self.redo_graph_edit():
+            return
         try:
             cmds.redo()
             self.update_scores_and_display()
         except Exception as exc:
-            self.tweaker_status.setText("Redo できません: %s" % exc)
+            self.tweaker_status.setText("Redo failed: %s" % exc)
 
+    def _graph_edit_snapshot(self):
+        chain = self._selected_chain()
+        if chain is None:
+            return {}
+        nodes = []
+        for joint in chain.joints:
+            if cmds.objExists(joint) and joint not in nodes:
+                nodes.append(joint)
+            for tweaker in self._tweakers_for_joint(joint):
+                if cmds.objExists(tweaker) and tweaker not in nodes:
+                    nodes.append(tweaker)
+        snapshot = {}
+        for node in nodes:
+            if cmds.objExists(node + ".rotate"):
+                snapshot[node] = _rotate_values(node)
+        return snapshot
+
+    def _graph_snapshots_differ(self, before, after):
+        if set(before) != set(after):
+            return True
+        for node, before_values in before.items():
+            after_values = after.get(node)
+            if after_values is None:
+                return True
+            if any(abs(before_values[i] - after_values[i]) > 0.0001 for i in range(3)):
+                return True
+        return False
+
+    def _push_graph_edit_snapshot(self, before, after):
+        if not self._graph_snapshots_differ(before, after):
+            return
+        # Reason: graph edits need a tool-local history because Maya undo records drag setAttr steps too finely.
+        self._graph_edit_undo_stack.append((before, after))
+        self._graph_edit_redo_stack = []
+
+    def _restore_graph_edit_snapshot(self, snapshot, fallback_snapshot=None):
+        fallback_snapshot = fallback_snapshot or {}
+        for node in fallback_snapshot:
+            if node not in snapshot and cmds.objExists(node + ".rotate"):
+                self._set_rotate_values(node, (0.0, 0.0, 0.0))
+        for node, values in snapshot.items():
+            if cmds.objExists(node + ".rotate"):
+                self._set_rotate_values(node, values)
+        self.update_scores_and_display()
+
+    def undo_graph_edit(self):
+        self.end_graph_undo()
+        if not self.is_monitoring and self._undo_pending_graph_edit():
+            return True
+        if not self._graph_edit_undo_stack:
+            return False
+        before, after = self._graph_edit_undo_stack.pop()
+        self._graph_edit_redo_stack.append((before, after))
+        self._restore_graph_edit_snapshot(before, after)
+        self.tweaker_status.setText("グラフ編集をUndoしました。")
+        return True
+
+    def redo_graph_edit(self):
+        self.end_graph_undo()
+        if not self.is_monitoring and self._redo_pending_graph_edit():
+            return True
+        if not self._graph_edit_redo_stack:
+            return False
+        before, after = self._graph_edit_redo_stack.pop()
+        self._graph_edit_undo_stack.append((before, after))
+        self._restore_graph_edit_snapshot(after, before)
+        self.tweaker_status.setText("グラフ編集をRedoしました。")
+        return True
     def _build_ui(self):
         main = QtWidgets.QVBoxLayout(self)
 
@@ -581,11 +657,18 @@ class TailCodeTATool(QtWidgets.QDialog):
         monitor_layout = QtWidgets.QHBoxLayout()
         self.start_button = QtWidgets.QPushButton("編集・自動更新 開始")
         self.stop_button = QtWidgets.QPushButton("編集・自動更新 停止")
+        self.graph_undo_button = QtWidgets.QPushButton("戻る")
+        self.graph_redo_button = QtWidgets.QPushButton("進む")
         self.start_button.clicked.connect(self.start_monitoring)
         self.stop_button.clicked.connect(self.stop_monitoring)
+        self.graph_undo_button.clicked.connect(self.undo_graph_edit)
+        self.graph_redo_button.clicked.connect(self.redo_graph_edit)
         self.stop_button.setEnabled(False)
         monitor_layout.addWidget(self.start_button)
         monitor_layout.addWidget(self.stop_button)
+        # Reason: graph edits use a dedicated history so users can undo one drag/apply step from the tool.
+        monitor_layout.addWidget(self.graph_undo_button)
+        monitor_layout.addWidget(self.graph_redo_button)
         monitor_layout.addStretch()
         main.addLayout(monitor_layout)
 
@@ -765,22 +848,24 @@ class TailCodeTATool(QtWidgets.QDialog):
 
     def begin_graph_undo(self):
         if not self.is_monitoring:
+            self._pending_graph_drag = None
             return
         if self.graph_undo_open:
             return
-        try:
-            cmds.undoInfo(openChunk=True, chunkName="TA Tool Graph Bend Edit")
-            self.graph_undo_open = True
-        except Exception:
-            self.graph_undo_open = False
+        # Reason: capture one before-state per graph drag instead of relying on Maya's per-setAttr undo history.
+        self._live_graph_drag_snapshot = self._graph_edit_snapshot()
+        self.graph_undo_open = True
 
     def end_graph_undo(self):
+        if not self.is_monitoring:
+            self._finish_pending_graph_drag()
+            return
         if not self.graph_undo_open:
             return
-        try:
-            cmds.undoInfo(closeChunk=True)
-        finally:
-            self.graph_undo_open = False
+        before = self._live_graph_drag_snapshot or {}
+        self._live_graph_drag_snapshot = None
+        self.graph_undo_open = False
+        self._push_graph_edit_snapshot(before, self._graph_edit_snapshot())
 
     def refresh_details(self, chain):
         result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
@@ -796,6 +881,46 @@ class TailCodeTATool(QtWidgets.QDialog):
             self.angle_graph.set_highlight_index(row_index)
             self.angle_graph.update()
 
+    def _pending_graph_value(self, row_index):
+        if 0 <= row_index < len(self.angle_graph.rows):
+            return float(self.angle_graph.rows[row_index]["bend"])
+        return 0.0
+
+    def _finish_pending_graph_drag(self):
+        if not self._pending_graph_drag:
+            return
+        row_index, start_bend = self._pending_graph_drag
+        end_bend = float(self._pending_graph_edits.get(row_index, self._pending_graph_value(row_index)))
+        self._pending_graph_drag = None
+        if abs(end_bend - start_bend) < 0.001:
+            return
+        # Reason: one graph drag should become one preview undo step, not many mouse-move steps.
+        self._pending_graph_undo_stack.append((row_index, start_bend, end_bend))
+        self._pending_graph_redo_stack = []
+
+    def _set_pending_graph_edit_value(self, row_index, target_bend):
+        self._pending_graph_edits[int(row_index)] = float(target_bend)
+        self._preview_pending_graph_edit(row_index, target_bend)
+
+    def _undo_pending_graph_edit(self):
+        self._finish_pending_graph_drag()
+        if not self._pending_graph_undo_stack:
+            return False
+        row_index, old_bend, new_bend = self._pending_graph_undo_stack.pop()
+        self._pending_graph_redo_stack.append((row_index, old_bend, new_bend))
+        self._set_pending_graph_edit_value(row_index, old_bend)
+        self.tweaker_status.setText("停止中グラフ編集をUndoしました。")
+        return True
+
+    def _redo_pending_graph_edit(self):
+        if not self._pending_graph_redo_stack:
+            return False
+        row_index, old_bend, new_bend = self._pending_graph_redo_stack.pop()
+        self._pending_graph_undo_stack.append((row_index, old_bend, new_bend))
+        self._set_pending_graph_edit_value(row_index, new_bend)
+        self.tweaker_status.setText("停止中グラフ編集をRedoしました。")
+        return True
+
     def apply_bend_edit(self, row_index, target_bend):
         if not self.is_monitoring:
             chain = self._selected_chain()
@@ -803,10 +928,14 @@ class TailCodeTATool(QtWidgets.QDialog):
                 return
             if self._pending_graph_edit_label != chain.label:
                 self._pending_graph_edits = {}
+                self._pending_graph_drag = None
+                self._pending_graph_undo_stack = []
+                self._pending_graph_redo_stack = []
                 self._pending_graph_edit_label = chain.label
+            if self._pending_graph_drag is None or self._pending_graph_drag[0] != int(row_index):
+                self._pending_graph_drag = (int(row_index), self._pending_graph_value(int(row_index)))
             # Reason: stopped mode previews graph edits and defers scene changes into one undoable apply step.
-            self._pending_graph_edits[int(row_index)] = float(target_bend)
-            self._preview_pending_graph_edit(row_index, target_bend)
+            self._set_pending_graph_edit_value(row_index, target_bend)
             self.tweaker_status.setText("編集・自動更新 開始時にグラフ編集をまとめて反映します。")
             return
         changed = self._apply_bend_edit(row_index, target_bend, select_target=True)
@@ -1107,26 +1236,36 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
+    def _clear_pending_graph_edits(self):
+        self._pending_graph_edits = {}
+        self._pending_graph_drag = None
+        self._pending_graph_undo_stack = []
+        self._pending_graph_redo_stack = []
+        self._pending_graph_edit_label = ""
+
     def _apply_pending_graph_edits(self):
         if not self._pending_graph_edits:
             return
         chain = self._selected_chain()
         if chain is None or chain.label != self._pending_graph_edit_label:
-            self._pending_graph_edits = {}
-            self._pending_graph_edit_label = ""
+            self._clear_pending_graph_edits()
             return
+        self._finish_pending_graph_drag()
         edits = sorted(self._pending_graph_edits.items())
-        self._pending_graph_edits = {}
-        self._pending_graph_edit_label = ""
+        if not edits:
+            self._clear_pending_graph_edits()
+            return
+        before = self._graph_edit_snapshot()
         changed = False
-        cmds.undoInfo(openChunk=True, chunkName="TA Tool Apply Pending Graph Edits")
-        try:
-            for row_index, target_bend in edits:
-                if self._apply_bend_edit(row_index, target_bend, select_target=False):
-                    changed = True
-        finally:
-            cmds.undoInfo(closeChunk=True)
+        for row_index, target_bend in edits:
+            if self._apply_bend_edit(row_index, target_bend, select_target=False):
+                changed = True
+
+        after = self._graph_edit_snapshot()
+        self._clear_pending_graph_edits()
         if changed:
+            # Reason: applying stopped graph edits should undo/redo as one tool action even when Maya undo chunks are unreliable.
+            self._push_graph_edit_snapshot(before, after)
             self.update_scores_and_display()
 
     def restart_monitoring_if_needed(self):
