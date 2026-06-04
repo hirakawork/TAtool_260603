@@ -797,6 +797,7 @@ class TailCodeTATool(QtWidgets.QDialog):
                 color_index=len(self.chains) % len(COLORS),
             )
             self.chains.append(chain)
+            # Reason: chain-owned tweakers prevent overlap from reusing owner-less joint tweakers.
             created = self._create_tweakers_for_chain(chain)
             if created:
                 self.tweaker_status.setText("チェーン登録時に Tweaker 作成: %s" % ", ".join(created))
@@ -816,12 +817,16 @@ class TailCodeTATool(QtWidgets.QDialog):
             joints = self._input_joints()
             if len(joints) >= 3:
                 chain.joints = joints
-                created = self._create_tweakers_for_chain(chain)
-                if created:
-                    self.tweaker_status.setText("チェーン更新時に Tweaker 作成: %s" % ", ".join(created))
             index = self._selected_chain_index()
+            old_label = chain.label
             chain.label = self._unique_chain_label(self.label_edit.text().strip() or chain.label, exclude_index=index)
+            # Reason: label edits must keep existing chain-owned tweakers addressable.
+            self._update_chain_tweaker_owner_label(old_label, chain.label)
             chain.threshold = float(self.threshold_spin.value())
+            # Reason: newly added joints in an updated chain need owner-specific tweakers.
+            created = self._create_tweakers_for_chain(chain)
+            if created:
+                self.tweaker_status.setText("チェーン更新時に Tweaker 作成: %s" % ", ".join(created))
             self.save_scene_data()
             self.restart_monitoring_if_needed()
             self.refresh_all()
@@ -1340,6 +1345,7 @@ class TailCodeTATool(QtWidgets.QDialog):
 
     def _tweaker_name_for_joint(self, joint, owner_label=None):
         joint_name = _safe_name(joint.split("|")[-1])
+        # Reason: overlapping chains need separate tweakers for the same joint.
         if owner_label:
             return "%s%s_%s" % (TWEAKER_PREFIX, _safe_name(owner_label), joint_name)
         return TWEAKER_PREFIX + joint_name
@@ -1391,6 +1397,23 @@ class TailCodeTATool(QtWidgets.QDialog):
         result.sort(key=lambda tweaker: (self._tweaker_priority(tweaker, joint), tweaker))
         return result
 
+    def _tweaker_for_joint_and_label(self, joint, label):
+        # Reason: creation status should ignore already-owned tweakers without falling back to owner-less ones.
+        for tweaker in self._tweakers_for_joint(joint):
+            if _get_string_attr(tweaker, "ownerChainLabel") == label:
+                return tweaker
+        return ""
+
+    def _update_chain_tweaker_owner_label(self, old_label, new_label):
+        if old_label == new_label:
+            return
+        for tweaker in self._all_tweakers():
+            if _get_string_attr(tweaker, "ownerChainLabel") != old_label:
+                continue
+            attr = tweaker + ".ownerChainLabel"
+            if cmds.objExists(attr):
+                cmds.setAttr(attr, new_label, type="string")
+
     def _selected_tweaker_targets(self):
         joints = cmds.ls(selection=True, type="joint") or []
         if joints:
@@ -1408,6 +1431,8 @@ class TailCodeTATool(QtWidgets.QDialog):
         failed = []
         for joint in chain.joints:
             try:
+                if self._tweaker_for_joint_and_label(joint, chain.label):
+                    continue
                 tweaker = self._create_tweaker(joint, owner_label=chain.label)
                 if tweaker not in created:
                     created.append(tweaker)
@@ -1445,9 +1470,11 @@ class TailCodeTATool(QtWidgets.QDialog):
             if not targets:
                 cmds.warning("Tweaker を作成するジョイントを選択してください。")
                 return
+            chain = self._selected_chain()
+            owner_label = chain.label if chain else None
             created = []
             for joint in targets:
-                created.append(self._create_tweaker(joint))
+                created.append(self._create_tweaker(joint, owner_label=owner_label))
             cmds.select(created, replace=True)
             self.tweaker_status.setText("作成: %s" % ", ".join(created))
         except Exception:
@@ -1459,6 +1486,7 @@ class TailCodeTATool(QtWidgets.QDialog):
 
         existing = self._tweakers_for_joint(joint)
         if owner_label:
+            # Reason: legacy owner-less tweakers must not block chain-owned ones.
             for tweaker in existing:
                 if _get_string_attr(tweaker, "ownerChainLabel") == owner_label:
                     return tweaker
@@ -1473,6 +1501,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         for axis in "XYZ":
             if cmds.objExists(tweaker + ".localScale" + axis):
                 cmds.setAttr(tweaker + ".localScale" + axis, 1.5)
+        # Reason: keeping tweakers directly under the stable root avoids chain subgroup transforms changing constraint results.
         cmds.parent(tweaker, group)
         _add_bool_attr(tweaker, "tailTweaker", True)
         _add_string_attr(tweaker, "targetJoint", _dag_path(joint))
@@ -1637,7 +1666,7 @@ class TailCodeTATool(QtWidgets.QDialog):
                 cmds.warning("しきい値を超える曲がり箇所がありません。")
                 return
             target_row = max(rows, key=lambda row: row["bend"])
-            tweaker = self._create_tweaker(target_row["joint"])
+            tweaker = self._create_tweaker(target_row["joint"], owner_label=chain.label)
             cmds.select(tweaker, replace=True)
             self.tweaker_status.setText("Auto Tweaker: %s  曲がり %.2f 度" % (target_row["joint"], target_row["bend"]))
         except Exception:
