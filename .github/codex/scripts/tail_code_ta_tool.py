@@ -44,6 +44,12 @@ DATA_ATTR = "chainsJson"
 DISPLAY_GROUP = "tailCodeTATool_display_GRP"
 TWEAKER_GROUP = "TailTweaker_GRP"
 TWEAKER_PREFIX = "TailTweaker_"
+TWIST_EDIT_MAX_STEP_DEGREES = 2.0
+TWIST_EDIT_MAX_RESPONSE_DEGREES = 25.0
+DRIVER_CONSTRAINT_TYPES = ("orientConstraint", "parentConstraint", "pointConstraint", "aimConstraint")
+NON_DRIVER_GRAPH_TYPES = ("objectSet", "displayLayer", "renderLayer", "shadingEngine")
+CONTROLLER_CHILD_EXPAND_DEFAULT_DEPTH = 1
+CONTROLLER_CHILD_EXPAND_MAX_DEPTH = 99
 
 
 COLORS = [
@@ -148,6 +154,27 @@ def _dominant_translate_axis(joint):
     return axis, tuple(vector)
 
 
+def _axis_override_name(axis):
+    axis = str(axis or "").strip().upper()
+    return axis if axis in ("X", "Y", "Z") else ""
+
+
+def _twist_axis_vector(joint, axis_override=None):
+    axis_override = _axis_override_name(axis_override)
+    if not axis_override:
+        return _dominant_translate_axis(joint)
+    axis = "XYZ".index(axis_override)
+    sign = 1.0
+    if cmds and cmds.objExists(joint + ".translate"):
+        values = cmds.getAttr(joint + ".translate")[0]
+        value = float(values[axis])
+        if abs(value) > 1e-8:
+            sign = -1.0 if value < 0.0 else 1.0
+    vector = [0.0, 0.0, 0.0]
+    vector[axis] = sign
+    return axis, tuple(vector)
+
+
 def _world_rotation_quaternion(node):
     if om is None or not cmds:
         return None
@@ -183,8 +210,8 @@ def _quaternion_angle_degrees(quat):
     return angle
 
 
-def _swing_twist_degrees(parent, child):
-    axis_index, axis_vector = _dominant_translate_axis(child)
+def _swing_twist_degrees(parent, child, axis_override=None):
+    axis_index, axis_vector = _twist_axis_vector(child, axis_override=axis_override)
     if axis_index < 0 or om is None:
         return 0.0, 0.0, "-"
     relative = _relative_quaternion(parent, child)
@@ -220,6 +247,47 @@ def _swing_twist_degrees(parent, child):
 def _dag_path(node):
     paths = cmds.ls(node, long=True) or []
     return paths[0] if paths else node
+
+
+def _same_dag_node(a, b):
+    if a == b:
+        return True
+    a_path = _dag_path(a) if cmds and a and cmds.objExists(a) else a
+    b_path = _dag_path(b) if cmds and b and cmds.objExists(b) else b
+    return a_path == b_path
+
+
+def _append_unique_joint(joints, joint):
+    if not _joint_exists(joint):
+        return
+    if any(_same_dag_node(existing, joint) for existing in joints):
+        return
+    joints.append(joint)
+
+
+def _child_joints(joint):
+    if not _joint_exists(joint):
+        return []
+    return cmds.listRelatives(joint, children=True, type="joint", fullPath=False) or []
+
+
+def _with_child_joints(joints, depth):
+    depth = max(0, min(int(depth), CONTROLLER_CHILD_EXPAND_MAX_DEPTH))
+    expanded = []
+    frontier = []
+    for joint in joints:
+        _append_unique_joint(expanded, joint)
+        frontier.append(joint)
+    for _level in range(depth):
+        next_frontier = []
+        for joint in frontier:
+            for child in _child_joints(joint):
+                next_frontier.append(child)
+                _append_unique_joint(expanded, child)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return expanded
 
 
 def _add_string_attr(node, attr, value):
@@ -258,6 +326,97 @@ def _get_string_attr(node, attr, default=""):
 
 def _is_tweaker(node):
     return bool(cmds.objExists(node) and cmds.attributeQuery("tailTweaker", node=node, exists=True) and cmds.getAttr(node + ".tailTweaker"))
+
+
+def _node_from_input_name(name):
+    return str(name or "").strip().split(".", 1)[0]
+
+
+def _transform_or_self(node):
+    if not cmds.objExists(node):
+        return node
+    try:
+        if cmds.nodeType(node) in ("joint", "transform"):
+            return node
+    except Exception:
+        return node
+    parents = cmds.listRelatives(node, parent=True, fullPath=False) or []
+    return parents[0] if parents else node
+
+
+def _downstream_joints(node, max_depth=4):
+    found = []
+    seen = {node}
+    frontier = [node]
+    for _depth in range(max_depth):
+        next_frontier = []
+        for current in frontier:
+            if not cmds.objExists(current):
+                continue
+            connections = cmds.listConnections(current, source=False, destination=True) or []
+            for connected in connections:
+                if connected in seen:
+                    continue
+                seen.add(connected)
+                if _joint_exists(connected):
+                    _append_unique_joint(found, connected)
+                elif cmds.objExists(connected) and cmds.nodeType(connected) not in NON_DRIVER_GRAPH_TYPES:
+                    next_frontier.append(connected)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return found
+
+
+def _controller_constraints(node):
+    constraints = []
+    for constraint_type in DRIVER_CONSTRAINT_TYPES:
+        found = cmds.listConnections(node, source=False, destination=True, type=constraint_type) or []
+        for constraint in found:
+            if constraint not in constraints:
+                constraints.append(constraint)
+    return constraints
+
+
+def _controller_driven_joints(node, child_depth=CONTROLLER_CHILD_EXPAND_DEFAULT_DEPTH):
+    transform = _transform_or_self(node)
+    joints = []
+    for constraint in _controller_constraints(transform):
+        for joint in _downstream_joints(constraint, max_depth=3):
+            _append_unique_joint(joints, joint)
+    if not joints:
+        for joint in cmds.listRelatives(transform, children=True, type="joint", fullPath=False) or []:
+            _append_unique_joint(joints, joint)
+    if not joints:
+        for joint in _downstream_joints(transform, max_depth=4):
+            _append_unique_joint(joints, joint)
+    return _with_child_joints(joints, child_depth)
+
+
+def _resolve_chain_joint_input(name, child_depth=CONTROLLER_CHILD_EXPAND_DEFAULT_DEPTH):
+    node = _node_from_input_name(name)
+    if not node or not cmds.objExists(node):
+        return []
+    node = _transform_or_self(node)
+    if _joint_exists(node):
+        return [node]
+    if _is_tweaker(node):
+        target = _get_string_attr(node, "targetJoint")
+        return [target] if _joint_exists(target) else []
+    return _controller_driven_joints(node, child_depth=child_depth)
+
+
+def _resolve_chain_joints(inputs, child_depth=CONTROLLER_CHILD_EXPAND_DEFAULT_DEPTH):
+    joints = []
+    unresolved = []
+    for name in inputs:
+        resolved = _resolve_chain_joint_input(name, child_depth=child_depth)
+        if not resolved:
+            unresolved.append(str(name))
+            continue
+        for joint in resolved:
+            _append_unique_joint(joints, joint)
+    return sort_root_to_tip(joints), unresolved
 
 
 def _find_orient_constraint_driving(node):
@@ -316,6 +475,7 @@ class ChainData:
     threshold: float = 15.0
     visible: bool = True
     color_index: int = 0
+    twist_axis_overrides: dict[str, str] = field(default_factory=dict)
     last_score: float = 0.0
     problem_joints: list[str] = field(default_factory=list)
 
@@ -326,20 +486,41 @@ class ChainData:
             "threshold": self.threshold,
             "visible": self.visible,
             "color_index": self.color_index,
+            "twist_axis_overrides": self.twist_axis_overrides,
         }
 
     @classmethod
     def from_dict(cls, data):
+        overrides = {}
+        for joint, axis in dict(data.get("twist_axis_overrides") or {}).items():
+            axis = _axis_override_name(axis)
+            if axis:
+                overrides[str(joint)] = axis
         return cls(
             label=str(data.get("label") or "chain"),
             joints=[str(j) for j in data.get("joints", []) if j],
             threshold=float(data.get("threshold", 15.0)),
             visible=bool(data.get("visible", True)),
             color_index=int(data.get("color_index", 0)),
+            twist_axis_overrides=overrides,
         )
 
 
 class JointAngleAnalyzer:
+    @staticmethod
+    def twist_axis_override_for_joint(joint, twist_axis_overrides):
+        if not twist_axis_overrides:
+            return ""
+        direct = _axis_override_name(twist_axis_overrides.get(joint))
+        if direct:
+            return direct
+        joint_long = _dag_path(joint) if cmds and cmds.objExists(joint) else joint
+        for key, axis in twist_axis_overrides.items():
+            key_long = _dag_path(key) if cmds and cmds.objExists(key) else key
+            if key == joint or key == joint_long or key_long == joint_long:
+                return _axis_override_name(axis)
+        return ""
+
     @staticmethod
     def bend_twist_axis(rows, index):
         axis = rows[index].get("twist_axis", "-") if 0 <= index < len(rows) else "-"
@@ -377,7 +558,7 @@ class JointAngleAnalyzer:
         return max(abs(v) for v in direction)
 
     @staticmethod
-    def evaluate(joints, threshold):
+    def evaluate(joints, threshold, twist_axis_overrides=None):
         valid = [j for j in joints if _joint_exists(j)]
         positions = [_world_position(j) for j in valid]
         rows = []
@@ -398,6 +579,7 @@ class JointAngleAnalyzer:
                     "twist": 0.0,
                     "twist_abs": 0.0,
                     "twist_axis": "-",
+                    "twist_axis_manual": False,
                 }
             )
 
@@ -415,7 +597,8 @@ class JointAngleAnalyzer:
             signed_delta = tuple(rotate[axis] - prev_rotate[axis] for axis in range(3))
             delta = tuple(abs(value) for value in signed_delta)
             max_delta = max(delta)
-            swing, twist, twist_axis = _swing_twist_degrees(rows[i - 1]["joint"], rows[i]["joint"])
+            axis_override = JointAngleAnalyzer.twist_axis_override_for_joint(rows[i]["joint"], twist_axis_overrides)
+            swing, twist, twist_axis = _swing_twist_degrees(rows[i - 1]["joint"], rows[i]["joint"], axis_override)
             rows[i]["delta"] = delta
             rows[i]["signed_delta"] = signed_delta
             rows[i]["max_delta"] = max_delta
@@ -423,6 +606,7 @@ class JointAngleAnalyzer:
             rows[i]["twist"] = twist
             rows[i]["twist_abs"] = abs(twist)
             rows[i]["twist_axis"] = twist_axis
+            rows[i]["twist_axis_manual"] = bool(axis_override)
             axis_deltas.append(delta)
 
         if rows:
@@ -474,6 +658,7 @@ class BendGraphWidget(QtWidgets.QWidget):
         self.line_color = color or QtGui.QColor(245, 190, 75)
         self.min_display_value = float(min_display_value)
         self.drag_index = None
+        self.drag_max_value = None
         self.highlight_index = None
         self.setMinimumHeight(210)
         self.setMouseTracking(True)
@@ -499,6 +684,8 @@ class BendGraphWidget(QtWidgets.QWidget):
         return self.rect().adjusted(44, 18, -18, -34)
 
     def _max_value(self):
+        if self.drag_max_value is not None:
+            return self.drag_max_value
         values = [self._row_value(row) for row in self.rows]
         max_value = max(values + [self.threshold * 2.0, 1.0])
         return max(self.min_display_value, math.ceil(max_value * 1.25 / 10.0) * 10.0)
@@ -541,6 +728,7 @@ class BendGraphWidget(QtWidgets.QWidget):
         if index is None:
             return
         self.drag_index = index
+        self.drag_max_value = self._max_value()
         self.bendEditStarted.emit()
         self.bendEdited.emit(index, self._value_from_y(pos.y()))
 
@@ -554,6 +742,8 @@ class BendGraphWidget(QtWidgets.QWidget):
         if self.drag_index is not None:
             self.bendEditFinished.emit()
         self.drag_index = None
+        self.drag_max_value = None
+        self.update()
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
@@ -635,6 +825,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self._graph_edit_undo_stack = []
         self._graph_edit_redo_stack = []
         self._live_graph_drag_snapshot = None
+        self._live_twist_drag = None
         self.graph_undo_open = False
         self._build_ui()
         self._install_undo_redo_shortcuts()
@@ -748,7 +939,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.label_edit = QtWidgets.QLineEdit()
         self.label_edit.setPlaceholderText("例：右手_親指 / 尻尾A")
         self.joints_edit = QtWidgets.QPlainTextEdit()
-        self.joints_edit.setPlaceholderText("ジョイント名を1行ずつ入力。空欄の場合は現在の選択を使います。")
+        self.joints_edit.setPlaceholderText("ジョイント名 / コントローラ名を1行ずつ入力。空欄の場合は現在の選択を使います。")
         self.joints_edit.setMaximumHeight(78)
         self.threshold_spin = QtWidgets.QDoubleSpinBox()
         self.threshold_spin.setRange(0.01, 9999.0)
@@ -756,6 +947,11 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.threshold_spin.setDecimals(2)
         self.threshold_spin.setSuffix(" 度（曲がり）")
         self.threshold_spin.valueChanged.connect(self.on_threshold_changed)
+        self.controller_child_depth_spin = QtWidgets.QSpinBox()
+        self.controller_child_depth_spin.setRange(0, CONTROLLER_CHILD_EXPAND_MAX_DEPTH)
+        self.controller_child_depth_spin.setValue(CONTROLLER_CHILD_EXPAND_DEFAULT_DEPTH)
+        self.controller_child_depth_spin.setSuffix(" 段")
+        self.controller_child_depth_spin.setToolTip("コントローラから見つかったジョイントの子方向を追加する段数です。")
         add_button = QtWidgets.QPushButton("選択チェーンを登録")
         add_button.clicked.connect(self.register_chain)
         update_button = QtWidgets.QPushButton("選択チェーンを更新")
@@ -764,12 +960,14 @@ class TailCodeTATool(QtWidgets.QDialog):
         remove_button.clicked.connect(self.remove_selected_chain)
         reg_layout.addWidget(QtWidgets.QLabel("ラベル"), 0, 0)
         reg_layout.addWidget(self.label_edit, 0, 1, 1, 3)
-        reg_layout.addWidget(QtWidgets.QLabel("ジョイント"), 1, 0)
+        reg_layout.addWidget(QtWidgets.QLabel("ジョイント / コントローラ"), 1, 0)
         reg_layout.addWidget(self.joints_edit, 1, 1, 1, 3)
         reg_layout.addWidget(QtWidgets.QLabel("角度差しきい値"), 2, 0)
         reg_layout.addWidget(self.threshold_spin, 2, 1)
         reg_layout.addWidget(add_button, 2, 2)
         reg_layout.addWidget(update_button, 2, 3)
+        reg_layout.addWidget(QtWidgets.QLabel("コントローラ子ジョイント"), 3, 0)
+        reg_layout.addWidget(self.controller_child_depth_spin, 3, 1)
         reg_layout.addWidget(remove_button, 3, 3)
         main.addWidget(register_box)
 
@@ -828,6 +1026,15 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.angle_table.cellClicked.connect(self.on_angle_table_cell_clicked)
         self.angle_table.currentCellChanged.connect(self.on_angle_table_current_cell_changed)
         self.angle_table.setMinimumHeight(190)
+        axis_layout = QtWidgets.QHBoxLayout()
+        axis_layout.addWidget(QtWidgets.QLabel("選択ジョイントのねじれ軸"))
+        self.twist_axis_combo = QtWidgets.QComboBox()
+        for label, value in [("Auto", ""), ("X", "X"), ("Y", "Y"), ("Z", "Z")]:
+            self.twist_axis_combo.addItem(label, value)
+        self.twist_axis_combo.setEnabled(False)
+        self.twist_axis_combo.currentIndexChanged.connect(self.on_twist_axis_override_changed)
+        axis_layout.addWidget(self.twist_axis_combo)
+        axis_layout.addStretch()
         self.angle_graph = BendGraphWidget()
         self.angle_graph.bendEditStarted.connect(self.begin_graph_undo)
         self.angle_graph.bendEdited.connect(self.apply_bend_edit)
@@ -842,6 +1049,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.twist_graph.bendEdited.connect(self.apply_twist_edit)
         self.twist_graph.bendEditFinished.connect(self.end_graph_undo)
         right_layout.addWidget(self.score_label)
+        right_layout.addLayout(axis_layout)
         right_layout.addWidget(self.angle_table)
         right_layout.addWidget(QtWidgets.QLabel("現在フレームの曲がり折れ線グラフ"))
         right_layout.addWidget(self.angle_graph)
@@ -898,6 +1106,56 @@ class TailCodeTATool(QtWidgets.QDialog):
             return self.chains[index]
         return None
 
+    def _current_angle_row(self):
+        row = self.angle_table.currentRow()
+        if row >= 0:
+            return row
+        selected_rows = sorted({item.row() for item in self.angle_table.selectedItems()})
+        return selected_rows[0] if selected_rows else -1
+
+    def _set_twist_axis_combo(self, axis, enabled):
+        if not hasattr(self, "twist_axis_combo"):
+            return
+        axis = _axis_override_name(axis)
+        index = self.twist_axis_combo.findData(axis)
+        if index < 0:
+            index = 0
+        self.twist_axis_combo.blockSignals(True)
+        try:
+            self.twist_axis_combo.setCurrentIndex(index)
+            self.twist_axis_combo.setEnabled(bool(enabled))
+        finally:
+            self.twist_axis_combo.blockSignals(False)
+
+    def _sync_twist_axis_combo(self, row_index=None):
+        chain = self._selected_chain()
+        if row_index is None:
+            row_index = self._current_angle_row()
+        if chain is None or not (0 < row_index < len(chain.joints)):
+            self._set_twist_axis_combo("", False)
+            return
+        joint = chain.joints[row_index]
+        self._set_twist_axis_combo(chain.twist_axis_overrides.get(joint, ""), True)
+
+    def on_twist_axis_override_changed(self, *_args):
+        chain = self._selected_chain()
+        row = self._current_angle_row()
+        if chain is None or not (0 < row < len(chain.joints)):
+            return
+        joint = chain.joints[row]
+        axis = _axis_override_name(self.twist_axis_combo.itemData(self.twist_axis_combo.currentIndex()))
+        if axis:
+            chain.twist_axis_overrides[joint] = axis
+        else:
+            chain.twist_axis_overrides.pop(joint, None)
+        self._live_twist_drag = None
+        self.save_scene_data()
+        self.refresh_details(chain)
+        self.angle_table.selectRow(row)
+        self._sync_twist_axis_combo(row)
+        label = axis if axis else "Auto"
+        self.tweaker_status.setText("ねじれ軸設定: %s -> %s" % (joint, label))
+
     def _unique_chain_label(self, label, exclude_index=None):
         base = (label or "").strip() or "chain_%02d" % (len(self.chains) + 1)
         used = {chain.label for i, chain in enumerate(self.chains) if i != exclude_index}
@@ -913,16 +1171,20 @@ class TailCodeTATool(QtWidgets.QDialog):
     def _input_joints(self):
         raw = self.joints_edit.toPlainText().strip()
         if raw:
-            joints = [line.strip() for line in raw.replace(",", "\n").splitlines() if line.strip()]
+            inputs = [line.strip() for line in raw.replace(",", "\n").splitlines() if line.strip()]
         else:
-            joints = cmds.ls(selection=True, type="joint") or []
-        return sort_root_to_tip(joints)
+            inputs = cmds.ls(selection=True, long=False) or []
+        child_depth = int(self.controller_child_depth_spin.value())
+        joints, unresolved = _resolve_chain_joints(inputs, child_depth=child_depth)
+        if unresolved:
+            cmds.warning("ジョイントへ解決できない入力をスキップしました: %s" % ", ".join(unresolved))
+        return joints
 
     def register_chain(self):
         try:
             joints = self._input_joints()
             if len(joints) < 3:
-                cmds.warning("3つ以上のジョイントを指定してください。")
+                cmds.warning("3つ以上のジョイント、または対応コントローラを指定してください。")
                 return
             requested_label = self.label_edit.text().strip() or "chain_%02d" % (len(self.chains) + 1)
             label = self._unique_chain_label(requested_label)
@@ -953,6 +1215,11 @@ class TailCodeTATool(QtWidgets.QDialog):
             joints = self._input_joints()
             if len(joints) >= 3:
                 chain.joints = joints
+                chain.twist_axis_overrides = {
+                    joint: axis
+                    for joint, axis in chain.twist_axis_overrides.items()
+                    if any(_same_dag_node(joint, chain_joint) for chain_joint in chain.joints)
+                }
             index = self._selected_chain_index()
             old_label = chain.label
             chain.label = self._unique_chain_label(self.label_edit.text().strip() or chain.label, exclude_index=index)
@@ -996,6 +1263,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         finally:
             self.threshold_spin.blockSignals(False)
         self.refresh_details(chain)
+        self._sync_twist_axis_combo()
 
     def refresh_all(self):
         self.chain_list.blockSignals(True)
@@ -1065,6 +1333,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.tweaker_status.setText("チェーン優先順位を更新しました。上にあるチェーンの Tweaker を優先します。")
 
     def begin_graph_undo(self):
+        self._live_twist_drag = None
         if not self.is_monitoring:
             self._pending_graph_drag = None
             return
@@ -1082,6 +1351,7 @@ class TailCodeTATool(QtWidgets.QDialog):
             return
         before = self._live_graph_drag_snapshot or {}
         self._live_graph_drag_snapshot = None
+        self._live_twist_drag = None
         self.graph_undo_open = False
         self._push_graph_edit_snapshot(before, self._graph_edit_snapshot())
 
@@ -1102,7 +1372,7 @@ class TailCodeTATool(QtWidgets.QDialog):
             self.refresh_details(chain)
 
     def refresh_details(self, chain):
-        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
         chain.last_score = result["score"]
         chain.problem_joints = result["problem_joints"]
         self.score_label.setText(
@@ -1214,7 +1484,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         chain = self._selected_chain()
         if chain is None:
             return False
-        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
         rows = result["angle_rows"]
         if not (0 <= row_index < len(rows)):
             return False
@@ -1258,11 +1528,46 @@ class TailCodeTATool(QtWidgets.QDialog):
         )
         return True
 
+    def _twist_drag_state(self, row_index, row):
+        if not self.graph_undo_open:
+            return None
+        joint = row["joint"]
+        state = self._live_twist_drag
+        if state and state["row_index"] == int(row_index) and state["joint"] == joint:
+            return state
+        axis = row.get("twist_axis", "-")
+        if axis not in "XYZ":
+            return None
+        current_twist = float(row.get("twist", 0.0))
+        state = {
+            "row_index": int(row_index),
+            "joint": joint,
+            "axis": axis,
+            "sign": -1.0 if current_twist < 0.0 else 1.0,
+            "last_abs": abs(current_twist),
+        }
+        self._live_twist_drag = state
+        return state
+
+    def _twist_delta_value(self, current_twist, target_abs, drag_state):
+        if drag_state:
+            desired = (target_abs - drag_state["last_abs"]) * drag_state["sign"]
+            return max(-TWIST_EDIT_MAX_STEP_DEGREES, min(TWIST_EDIT_MAX_STEP_DEGREES, desired))
+        sign = -1.0 if current_twist < 0.0 else 1.0
+        return target_abs * sign - current_twist
+
+    def _twist_response_abs(self, chain, row_index):
+        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
+        rows = result["angle_rows"]
+        if not (0 <= row_index < len(rows)):
+            return None
+        return abs(float(rows[row_index].get("twist", 0.0)))
+
     def _apply_twist_edit(self, row_index, target_twist, select_target=False):
         chain = self._selected_chain()
         if chain is None:
             return False
-        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+        result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
         rows = result["angle_rows"]
         if not (0 <= row_index < len(rows)):
             return False
@@ -1272,44 +1577,59 @@ class TailCodeTATool(QtWidgets.QDialog):
 
         row = rows[row_index]
         joint = row["joint"]
-        axis = row.get("twist_axis", "-")
+        drag_state = self._twist_drag_state(row_index, row)
+        axis = drag_state["axis"] if drag_state else row.get("twist_axis", "-")
         if axis not in "XYZ":
             self.tweaker_status.setText("ねじれ軸を判定できません。先に少し回転差を付けてください。")
             return False
         current_twist = float(row.get("twist", 0.0))
         current_abs = abs(current_twist)
         target_abs = max(0.0, float(target_twist))
-        sign = -1.0 if current_twist < 0.0 else 1.0
-        desired_twist = target_abs * sign
-        delta_value = desired_twist - current_twist
+        delta_value = self._twist_delta_value(current_twist, target_abs, drag_state)
         if abs(delta_value) < 0.005:
             return False
 
         tweakers = self._tweakers_for_joint(joint)
         has_incoming = any(_attr_has_incoming_connection("%s.rotate%s" % (joint, check_axis)) for check_axis in "XYZ")
 
+        previous_values = None
         if tweakers:
             target_node = tweakers[0]
             current_tweaker_rotate = _rotate_values(target_node)
+            previous_values = current_tweaker_rotate
             values = list(current_tweaker_rotate)
             values["XYZ".index(axis)] += delta_value
             self._set_rotate_values(target_node, tuple(values))
         elif has_incoming:
             target_node = self._create_tweaker(joint)
+            previous_values = _rotate_values(target_node)
             values = [0.0, 0.0, 0.0]
             values["XYZ".index(axis)] = delta_value
             self._set_rotate_values(target_node, tuple(values))
         else:
             rotate = list(row["rotate"])
+            previous_values = tuple(rotate)
             rotate["XYZ".index(axis)] += delta_value
             self._set_rotate_values(joint, tuple(rotate))
             target_node = joint
 
+        response_abs = None
+        if drag_state:
+            response_abs = self._twist_response_abs(chain, row_index)
+            if response_abs is None or abs(response_abs - drag_state["last_abs"]) > TWIST_EDIT_MAX_RESPONSE_DEGREES:
+                if previous_values is not None:
+                    self._set_rotate_values(target_node, previous_values)
+                self._live_twist_drag = None
+                self.tweaker_status.setText("ねじれ値が急変したため調整を止めました。ねじれ軸を確認してください: %s" % joint)
+                return False
+            drag_state["last_abs"] = response_abs
+
         if select_target:
             cmds.select(target_node, replace=True)
+        display_target = response_abs if response_abs is not None else target_abs
         self.tweaker_status.setText(
             "ねじれ調整: %s  %s %.2f -> %.2f"
-            % (joint, axis, current_abs, target_abs)
+            % (joint, axis, current_abs, display_target)
         )
         return True
 
@@ -1332,6 +1652,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         if not selected_rows:
             self.angle_graph.set_highlight_index(None)
             self.twist_graph.set_highlight_index(None)
+            self._set_twist_axis_combo("", False)
             return
         self._select_joint_from_angle_table_row(selected_rows[0])
 
@@ -1349,6 +1670,7 @@ class TailCodeTATool(QtWidgets.QDialog):
 
         self.angle_graph.set_highlight_index(row_index)
         self.twist_graph.set_highlight_index(row_index)
+        self._sync_twist_axis_combo(row_index)
         if not _joint_exists(joint):
             self.tweaker_status.setText("ジョイントが見つかりません: %s" % joint)
             return
@@ -1376,12 +1698,15 @@ class TailCodeTATool(QtWidgets.QDialog):
     def _fill_angle_table(self, rows, threshold):
         self.angle_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
+            twist_axis = row["twist_axis"]
+            if row.get("twist_axis_manual") and twist_axis in "XYZ":
+                twist_axis += "*"
             values = [
                 row["joint"],
                 "%.2f" % row["bend"],
                 "%.2f" % row["twist"],
                 "%.2f" % row["twist_abs"],
-                row["twist_axis"],
+                twist_axis,
                 "%.2f" % row["rotate"][0],
                 "%.2f" % row["rotate"][1],
                 "%.2f" % row["rotate"][2],
@@ -1402,7 +1727,7 @@ class TailCodeTATool(QtWidgets.QDialog):
             if not chain.visible:
                 self._delete_display_curve(chain)
                 continue
-            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
             chain.last_score = result["score"]
             chain.problem_joints = result["problem_joints"]
             self._update_display_curve(chain, result["positions"])
@@ -1546,6 +1871,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self._monitored_joint_paths = set()
         self._pending_score_update = False
         self._last_auto_score_update = 0.0
+        self._live_twist_drag = None
         self.is_monitoring = False
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -2076,7 +2402,7 @@ class TailCodeTATool(QtWidgets.QDialog):
             if chain is None:
                 cmds.warning("Auto Tweaker 用のチェーンを選択してください。")
                 return
-            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
             rows = [row for row in result["angle_rows"] if row["bend"] > chain.threshold]
             if not rows:
                 cmds.warning("しきい値を超える曲がり箇所がありません。")
@@ -2094,7 +2420,7 @@ class TailCodeTATool(QtWidgets.QDialog):
             if chain is None:
                 cmds.warning("Smart Suggest 用のチェーンを選択してください。")
                 return
-            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold)
+            result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
             rows = result["angle_rows"]
             if not rows:
                 return
