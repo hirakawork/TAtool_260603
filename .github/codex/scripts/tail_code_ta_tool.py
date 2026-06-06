@@ -341,6 +341,42 @@ class ChainData:
 
 class JointAngleAnalyzer:
     @staticmethod
+    def bend_twist_axis(rows, index):
+        axis = rows[index].get("twist_axis", "-") if 0 <= index < len(rows) else "-"
+        if axis not in "XYZ" and index == 0 and len(rows) > 1:
+            axis = rows[1].get("twist_axis", "-")
+        return axis if axis in "XYZ" else "-"
+
+    @staticmethod
+    def bend_direction(rows, index):
+        if not (0 <= index < len(rows)):
+            return (0.0, 0.0, 0.0)
+        axis = JointAngleAnalyzer.bend_twist_axis(rows, index)
+        excluded_axis_index = "XYZ".index(axis) if axis in "XYZ" else -1
+
+        def _without_twist(values):
+            result = list(values)
+            if excluded_axis_index >= 0:
+                result[excluded_axis_index] = 0.0
+            return result
+
+        row = rows[index]
+        direction = _without_twist(row["rotate"])
+        if max(abs(v) for v in direction) < 0.001:
+            if index == 0 and len(rows) > 1:
+                direction = _without_twist(tuple(-v for v in rows[1].get("signed_delta", (0.0, 0.0, 0.0))))
+            elif index > 0:
+                direction = _without_twist(row.get("signed_delta", (0.0, 0.0, 0.0)))
+        return tuple(direction)
+
+    @staticmethod
+    def endpoint_bend_value(rows, index):
+        if not rows or index not in (0, len(rows) - 1):
+            return 0.0
+        direction = JointAngleAnalyzer.bend_direction(rows, index)
+        return max(abs(v) for v in direction)
+
+    @staticmethod
     def evaluate(joints, threshold):
         valid = [j for j in joints if _joint_exists(j)]
         positions = [_world_position(j) for j in valid]
@@ -389,6 +425,10 @@ class JointAngleAnalyzer:
             rows[i]["twist_axis"] = twist_axis
             axis_deltas.append(delta)
 
+        if rows:
+            for index in sorted({0, len(rows) - 1}):
+                rows[index]["bend"] = JointAngleAnalyzer.endpoint_bend_value(rows, index)
+
         bend_values = [row["bend"] for row in rows]
         twist_values = [row["twist_abs"] for row in rows]
         bend_deltas = []
@@ -396,10 +436,9 @@ class JointAngleAnalyzer:
         for i in range(1, len(rows)):
             delta = abs(rows[i]["bend"] - rows[i - 1]["bend"])
             bend_deltas.append(delta)
-            if rows[i]["bend"] > threshold:
-                problem_joints.append(rows[i]["joint"])
             if rows[i]["twist_abs"] > threshold:
                 twist_problem_joints.append(rows[i]["joint"])
+        problem_joints = [row["joint"] for row in rows if row["bend"] > threshold]
 
         score = sum(max(0.0, bend - threshold) for bend in bend_values)
         twist_score = sum(max(0.0, twist - threshold) for twist in twist_values)
@@ -426,13 +465,14 @@ class BendGraphWidget(QtWidgets.QWidget):
     bendEdited = QtCore.Signal(int, float)
     bendEditFinished = QtCore.Signal()
 
-    def __init__(self, parent=None, value_key="bend", label="曲がり", color=None):
+    def __init__(self, parent=None, value_key="bend", label="曲がり", color=None, min_display_value=50.0):
         super().__init__(parent)
         self.rows = []
         self.threshold = 15.0
         self.value_key = value_key
         self.label = label
         self.line_color = color or QtGui.QColor(245, 190, 75)
+        self.min_display_value = float(min_display_value)
         self.drag_index = None
         self.highlight_index = None
         self.setMinimumHeight(210)
@@ -461,7 +501,7 @@ class BendGraphWidget(QtWidgets.QWidget):
     def _max_value(self):
         values = [self._row_value(row) for row in self.rows]
         max_value = max(values + [self.threshold * 2.0, 1.0])
-        return max(50.0, math.ceil(max_value * 1.25 / 10.0) * 10.0)
+        return max(self.min_display_value, math.ceil(max_value * 1.25 / 10.0) * 10.0)
 
     def _row_value(self, row):
         try:
@@ -792,7 +832,12 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.angle_graph.bendEditStarted.connect(self.begin_graph_undo)
         self.angle_graph.bendEdited.connect(self.apply_bend_edit)
         self.angle_graph.bendEditFinished.connect(self.end_graph_undo)
-        self.twist_graph = BendGraphWidget(value_key="twist_abs", label="ねじれ量", color=QtGui.QColor(100, 205, 210))
+        self.twist_graph = BendGraphWidget(
+            value_key="twist_abs",
+            label="ねじれ量",
+            color=QtGui.QColor(100, 205, 210),
+            min_display_value=10.0,
+        )
         self.twist_graph.bendEditStarted.connect(self.begin_graph_undo)
         self.twist_graph.bendEdited.connect(self.apply_twist_edit)
         self.twist_graph.bendEditFinished.connect(self.end_graph_undo)
@@ -1173,9 +1218,6 @@ class TailCodeTATool(QtWidgets.QDialog):
         rows = result["angle_rows"]
         if not (0 <= row_index < len(rows)):
             return False
-        if row_index == 0 or row_index == len(rows) - 1:
-            self.tweaker_status.setText("Root/Tip は前後ジョイントが足りないため曲がり調整できません。")
-            return False
 
         row = rows[row_index]
         joint = row["joint"]
@@ -1185,15 +1227,8 @@ class TailCodeTATool(QtWidgets.QDialog):
             return False
 
         rotate = row["rotate"]
-        twist_axis = row.get("twist_axis", "-")
-        excluded_axis_index = "XYZ".index(twist_axis) if twist_axis in "XYZ" else -1
-        direction = list(rotate)
-        if excluded_axis_index >= 0:
-            direction[excluded_axis_index] = 0.0
-        if max(abs(v) for v in direction) < 0.001 and row_index > 0:
-            direction = list(row["signed_delta"])
-            if excluded_axis_index >= 0:
-                direction[excluded_axis_index] = 0.0
+        twist_axis = JointAngleAnalyzer.bend_twist_axis(rows, row_index)
+        direction = list(JointAngleAnalyzer.bend_direction(rows, row_index))
         if max(abs(v) for v in direction) < 0.001:
             self.tweaker_status.setText("ねじれ軸を除いた曲がり方向がありません。先に曲がり側の軸へ少し回転を付けてください。")
             return False
@@ -1277,17 +1312,6 @@ class TailCodeTATool(QtWidgets.QDialog):
             % (joint, axis, current_abs, target_abs)
         )
         return True
-
-    def _bend_direction(self, rows, row_index):
-        row = rows[row_index]
-        direction = row["rotate"]
-        if max(abs(v) for v in direction) < 0.001 and row_index > 0:
-            prev_rotate = rows[row_index - 1]["rotate"]
-            direction = tuple(row["rotate"][i] - prev_rotate[i] for i in range(3))
-        max_axis = max(abs(v) for v in direction)
-        if max_axis < 0.001:
-            return None
-        return tuple(v / max_axis for v in direction)
 
     def _set_rotate_values(self, node, values):
         for axis, value in zip("XYZ", values):
