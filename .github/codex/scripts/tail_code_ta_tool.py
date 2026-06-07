@@ -39,6 +39,11 @@ except Exception:
 
 
 WINDOW_OBJECT_NAME = "tailCodeTAToolWindow"
+WINDOW_DEFAULT_WIDTH = 920
+WINDOW_DEFAULT_HEIGHT = 720
+WINDOW_MIN_WIDTH = 760
+WINDOW_MIN_HEIGHT = 420
+WINDOW_SCREEN_MARGIN = 96
 DATA_NODE = "tailCodeTATool_sceneData"
 DATA_ATTR = "chainsJson"
 DISPLAY_GROUP = "tailCodeTATool_display_GRP"
@@ -649,7 +654,15 @@ class BendGraphWidget(QtWidgets.QWidget):
     bendEdited = QtCore.Signal(int, float)
     bendEditFinished = QtCore.Signal()
 
-    def __init__(self, parent=None, value_key="bend", label="曲がり", color=None, min_display_value=50.0):
+    def __init__(
+        self,
+        parent=None,
+        value_key="bend",
+        label="曲がり",
+        color=None,
+        min_display_value=50.0,
+        signed=False,
+    ):
         super().__init__(parent)
         self.rows = []
         self.threshold = 15.0
@@ -657,6 +670,7 @@ class BendGraphWidget(QtWidgets.QWidget):
         self.label = label
         self.line_color = color or QtGui.QColor(245, 190, 75)
         self.min_display_value = float(min_display_value)
+        self.signed = bool(signed)
         self.drag_index = None
         self.drag_max_value = None
         self.highlight_index = None
@@ -687,12 +701,15 @@ class BendGraphWidget(QtWidgets.QWidget):
         if self.drag_max_value is not None:
             return self.drag_max_value
         values = [self._row_value(row) for row in self.rows]
+        if self.signed:
+            values = [abs(value) for value in values]
         max_value = max(values + [self.threshold * 2.0, 1.0])
         return max(self.min_display_value, math.ceil(max_value * 1.25 / 10.0) * 10.0)
 
     def _row_value(self, row):
         try:
-            return max(0.0, float(row.get(self.value_key, 0.0)))
+            value = float(row.get(self.value_key, 0.0))
+            return value if self.signed else max(0.0, value)
         except Exception:
             return 0.0
 
@@ -700,13 +717,20 @@ class BendGraphWidget(QtWidgets.QWidget):
         plot = self._plot_rect()
         max_value = self._max_value()
         x = plot.left() + (index / max(1, len(self.rows) - 1)) * plot.width()
-        y = plot.bottom() - (value / max_value) * plot.height()
+        if self.signed:
+            center = plot.center().y()
+            y = center - (value / max_value) * (plot.height() * 0.5)
+        else:
+            y = plot.bottom() - (value / max_value) * plot.height()
         return QtCore.QPointF(x, y)
 
     def _value_from_y(self, y):
         plot = self._plot_rect()
         max_value = self._max_value()
         y = max(plot.top(), min(plot.bottom(), y))
+        if self.signed:
+            center = plot.center().y()
+            return (center - y) / max(1.0, plot.height() * 0.5) * max_value
         return max(0.0, (plot.bottom() - y) / max(1.0, plot.height()) * max_value)
 
     def _nearest_index(self, pos):
@@ -762,9 +786,19 @@ class BendGraphWidget(QtWidgets.QWidget):
         values = [self._row_value(row) for row in self.rows]
         max_value = self._max_value()
 
-        threshold_y = plot.bottom() - (self.threshold / max_value) * plot.height()
         painter.setPen(QtGui.QPen(QtGui.QColor(210, 80, 70), 1, QtCore.Qt.DashLine))
-        painter.drawLine(QtCore.QPointF(plot.left(), threshold_y), QtCore.QPointF(plot.right(), threshold_y))
+        if self.signed:
+            center_y = plot.center().y()
+            painter.setPen(QtGui.QPen(QtGui.QColor(120, 125, 135), 1))
+            painter.drawLine(QtCore.QPointF(plot.left(), center_y), QtCore.QPointF(plot.right(), center_y))
+            painter.setPen(QtGui.QPen(QtGui.QColor(210, 80, 70), 1, QtCore.Qt.DashLine))
+            positive_y = self._point(0, self.threshold).y()
+            negative_y = self._point(0, -self.threshold).y()
+            painter.drawLine(QtCore.QPointF(plot.left(), positive_y), QtCore.QPointF(plot.right(), positive_y))
+            painter.drawLine(QtCore.QPointF(plot.left(), negative_y), QtCore.QPointF(plot.right(), negative_y))
+        else:
+            threshold_y = plot.bottom() - (self.threshold / max_value) * plot.height()
+            painter.drawLine(QtCore.QPointF(plot.left(), threshold_y), QtCore.QPointF(plot.right(), threshold_y))
 
         path = QtGui.QPainterPath()
         for index, value in enumerate(values):
@@ -779,7 +813,7 @@ class BendGraphWidget(QtWidgets.QWidget):
         for index, row in enumerate(self.rows):
             value = self._row_value(row)
             p = self._point(index, value)
-            if value > self.threshold:
+            if abs(value) > self.threshold:
                 painter.setBrush(QtGui.QColor(225, 70, 60))
                 painter.setPen(QtGui.QColor(225, 70, 60))
                 painter.drawEllipse(p, 5, 5)
@@ -799,7 +833,11 @@ class BendGraphWidget(QtWidgets.QWidget):
 
         painter.setPen(QtGui.QColor(170, 174, 182))
         painter.drawText(QtCore.QPointF(8, plot.top() + 10), "%.0f" % max_value)
-        painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
+        if self.signed:
+            painter.drawText(QtCore.QPointF(8, plot.bottom()), "%.0f" % -max_value)
+            painter.drawText(QtCore.QPointF(12, plot.center().y() - 2), "0")
+        else:
+            painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
 
 
 class TailCodeTATool(QtWidgets.QDialog):
@@ -807,8 +845,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         super().__init__(parent)
         _require_maya()
         self.setObjectName(WINDOW_OBJECT_NAME)
-        self.setWindowTitle("尻尾・コード TA ツール")
-        self.resize(920, 820)
+        self._configure_window()
         self.chains = []
         self.callbacks = []
         self.is_monitoring = False
@@ -831,6 +868,56 @@ class TailCodeTATool(QtWidgets.QDialog):
         self._install_undo_redo_shortcuts()
         self.load_scene_data()
         self.refresh_all()
+
+    def _configure_window(self):
+        self.setWindowTitle("尻尾・コード TA ツール")
+        flags = (
+            self.windowFlags()
+            | QtCore.Qt.Window
+            | QtCore.Qt.WindowSystemMenuHint
+            | QtCore.Qt.WindowMinimizeButtonHint
+        )
+        self.setWindowFlags(flags)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.resize(WINDOW_DEFAULT_WIDTH, self._initial_window_height())
+
+    def _initial_window_height(self):
+        geometry = self._available_screen_geometry()
+        if geometry is None:
+            return WINDOW_DEFAULT_HEIGHT
+        available_height = max(WINDOW_MIN_HEIGHT, geometry.height() - WINDOW_SCREEN_MARGIN)
+        return min(WINDOW_DEFAULT_HEIGHT, available_height)
+
+    def _available_screen_geometry(self):
+        screen = self.screen() if hasattr(self, "screen") else None
+        app = QtWidgets.QApplication.instance()
+        if screen is None and app is not None and hasattr(app, "primaryScreen"):
+            screen = app.primaryScreen()
+        if screen is not None:
+            return screen.availableGeometry()
+        if hasattr(QtWidgets.QApplication, "desktop"):
+            desktop = QtWidgets.QApplication.desktop()
+            return desktop.availableGeometry(self)
+        return None
+
+    def _create_scroll_layout(self):
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        self.scroll_area = QtWidgets.QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+
+        self.scroll_content = QtWidgets.QWidget()
+        main = QtWidgets.QVBoxLayout(self.scroll_content)
+        self.scroll_area.setWidget(self.scroll_content)
+        outer.addWidget(self.scroll_area)
+        return main
+
+    def minimize_window(self):
+        self.showMinimized()
 
     def _install_undo_redo_shortcuts(self):
         undo_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
@@ -932,7 +1019,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.tweaker_status.setText("グラフ編集をRedoしました。")
         return True
     def _build_ui(self):
-        main = QtWidgets.QVBoxLayout(self)
+        main = self._create_scroll_layout()
 
         register_box = QtWidgets.QGroupBox("チェーン登録")
         reg_layout = QtWidgets.QGridLayout(register_box)
@@ -1004,7 +1091,7 @@ class TailCodeTATool(QtWidgets.QDialog):
                 "ジョイント",
                 "曲がり",
                 "ねじれ",
-                "ねじれ量",
+                "|ねじれ|",
                 "ねじれ軸",
                 "回転 X",
                 "回転 Y",
@@ -1040,10 +1127,11 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.angle_graph.bendEdited.connect(self.apply_bend_edit)
         self.angle_graph.bendEditFinished.connect(self.end_graph_undo)
         self.twist_graph = BendGraphWidget(
-            value_key="twist_abs",
-            label="ねじれ量",
+            value_key="twist",
+            label="ねじれ",
             color=QtGui.QColor(100, 205, 210),
             min_display_value=10.0,
+            signed=True,
         )
         self.twist_graph.bendEditStarted.connect(self.begin_graph_undo)
         self.twist_graph.bendEdited.connect(self.apply_twist_edit)
@@ -1053,7 +1141,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         right_layout.addWidget(self.angle_table)
         right_layout.addWidget(QtWidgets.QLabel("現在フレームの曲がり折れ線グラフ"))
         right_layout.addWidget(self.angle_graph)
-        right_layout.addWidget(QtWidgets.QLabel("現在フレームのねじれ量グラフ"))
+        right_layout.addWidget(QtWidgets.QLabel("現在フレームのねじれグラフ"))
         right_layout.addWidget(self.twist_graph)
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 2)
@@ -1064,16 +1152,19 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.stop_button = QtWidgets.QPushButton("編集・自動更新 停止")
         self.graph_undo_button = QtWidgets.QPushButton("戻る")
         self.graph_redo_button = QtWidgets.QPushButton("進む")
+        minimize_button = QtWidgets.QPushButton("最小化")
         self.start_button.clicked.connect(self.start_monitoring)
         self.stop_button.clicked.connect(self.stop_monitoring)
         self.graph_undo_button.clicked.connect(self.undo_graph_edit)
         self.graph_redo_button.clicked.connect(self.redo_graph_edit)
+        minimize_button.clicked.connect(self.minimize_window)
         self.stop_button.setEnabled(False)
         monitor_layout.addWidget(self.start_button)
         monitor_layout.addWidget(self.stop_button)
         # Reason: graph edits use a dedicated history so users can undo one drag/apply step from the tool.
         monitor_layout.addWidget(self.graph_undo_button)
         monitor_layout.addWidget(self.graph_redo_button)
+        monitor_layout.addWidget(minimize_button)
         monitor_layout.addStretch()
         main.addLayout(monitor_layout)
 
@@ -1387,7 +1478,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         return self.twist_graph if metric == "twist" else self.angle_graph
 
     def _graph_value_key(self, metric):
-        return "twist_abs" if metric == "twist" else "bend"
+        return "twist" if metric == "twist" else "bend"
 
     def _preview_pending_graph_edit(self, metric, row_index, target_value):
         graph = self._graph_for_metric(metric)
@@ -1543,25 +1634,23 @@ class TailCodeTATool(QtWidgets.QDialog):
             "row_index": int(row_index),
             "joint": joint,
             "axis": axis,
-            "sign": -1.0 if current_twist < 0.0 else 1.0,
-            "last_abs": abs(current_twist),
+            "last_twist": current_twist,
         }
         self._live_twist_drag = state
         return state
 
-    def _twist_delta_value(self, current_twist, target_abs, drag_state):
+    def _twist_delta_value(self, current_twist, target_twist, drag_state):
         if drag_state:
-            desired = (target_abs - drag_state["last_abs"]) * drag_state["sign"]
+            desired = target_twist - drag_state["last_twist"]
             return max(-TWIST_EDIT_MAX_STEP_DEGREES, min(TWIST_EDIT_MAX_STEP_DEGREES, desired))
-        sign = -1.0 if current_twist < 0.0 else 1.0
-        return target_abs * sign - current_twist
+        return target_twist - current_twist
 
-    def _twist_response_abs(self, chain, row_index):
+    def _twist_response_value(self, chain, row_index):
         result = JointAngleAnalyzer.evaluate(chain.joints, chain.threshold, chain.twist_axis_overrides)
         rows = result["angle_rows"]
         if not (0 <= row_index < len(rows)):
             return None
-        return abs(float(rows[row_index].get("twist", 0.0)))
+        return float(rows[row_index].get("twist", 0.0))
 
     def _apply_twist_edit(self, row_index, target_twist, select_target=False):
         chain = self._selected_chain()
@@ -1583,9 +1672,8 @@ class TailCodeTATool(QtWidgets.QDialog):
             self.tweaker_status.setText("ねじれ軸を判定できません。先に少し回転差を付けてください。")
             return False
         current_twist = float(row.get("twist", 0.0))
-        current_abs = abs(current_twist)
-        target_abs = max(0.0, float(target_twist))
-        delta_value = self._twist_delta_value(current_twist, target_abs, drag_state)
+        target_twist = float(target_twist)
+        delta_value = self._twist_delta_value(current_twist, target_twist, drag_state)
         if abs(delta_value) < 0.005:
             return False
 
@@ -1613,23 +1701,23 @@ class TailCodeTATool(QtWidgets.QDialog):
             self._set_rotate_values(joint, tuple(rotate))
             target_node = joint
 
-        response_abs = None
+        response_twist = None
         if drag_state:
-            response_abs = self._twist_response_abs(chain, row_index)
-            if response_abs is None or abs(response_abs - drag_state["last_abs"]) > TWIST_EDIT_MAX_RESPONSE_DEGREES:
+            response_twist = self._twist_response_value(chain, row_index)
+            if response_twist is None or abs(response_twist - drag_state["last_twist"]) > TWIST_EDIT_MAX_RESPONSE_DEGREES:
                 if previous_values is not None:
                     self._set_rotate_values(target_node, previous_values)
                 self._live_twist_drag = None
                 self.tweaker_status.setText("ねじれ値が急変したため調整を止めました。ねじれ軸を確認してください: %s" % joint)
                 return False
-            drag_state["last_abs"] = response_abs
+            drag_state["last_twist"] = response_twist
 
         if select_target:
             cmds.select(target_node, replace=True)
-        display_target = response_abs if response_abs is not None else target_abs
+        display_target = response_twist if response_twist is not None else target_twist
         self.tweaker_status.setText(
             "ねじれ調整: %s  %s %.2f -> %.2f"
-            % (joint, axis, current_abs, display_target)
+            % (joint, axis, current_twist, display_target)
         )
         return True
 
