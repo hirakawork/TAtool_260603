@@ -67,6 +67,31 @@ COLORS = [
 ]
 
 
+def _reference_metric_name(metric):
+    metric = str(metric or "").strip().lower()
+    return "twist" if metric == "twist" else "bend"
+
+
+def _reference_profile_mode(mode):
+    mode = str(mode or "").strip().lower()
+    return "peaks" if mode == "peaks" else "bezier"
+
+
+def _default_reference_points(metric="bend"):
+    if _reference_metric_name(metric) == "twist":
+        return [(0.0, 0.0), (0.30, 8.0), (0.70, -8.0), (1.0, 0.0)]
+    return [(0.0, 0.0), (0.30, 18.0), (0.70, 18.0), (1.0, 0.0)]
+
+
+def _default_reference_peaks(metric="bend"):
+    if _reference_metric_name(metric) == "twist":
+        return [
+            {"center": 0.35, "height": 8.0, "width": 0.18, "sharpness": 1.0},
+            {"center": 0.70, "height": -8.0, "width": 0.18, "sharpness": 1.0},
+        ]
+    return [{"center": 0.50, "height": 18.0, "width": 0.22, "sharpness": 1.0}]
+
+
 def _require_maya():
     if cmds is None or om is None:
         raise RuntimeError("This tool must be run inside Maya.")
@@ -474,6 +499,148 @@ def sort_root_to_tip(joints):
 
 
 @dataclass
+class ReferenceCurveData:
+    label: str
+    metric: str = "bend"
+    points: list[tuple[float, float]] = field(default_factory=_default_reference_points)
+    profile_mode: str = "bezier"
+    peaks: list[dict] = field(default_factory=list)
+    baseline: float = 0.0
+    visible: bool = True
+    color_index: int = 0
+
+    def to_dict(self):
+        return {
+            "label": self.label,
+            "metric": _reference_metric_name(self.metric),
+            "points": [[float(x), float(y)] for x, y in self.normalized_points()],
+            "profile_mode": _reference_profile_mode(self.profile_mode),
+            "peaks": self.normalized_peaks(),
+            "baseline": float(self.baseline),
+            "visible": self.visible,
+            "color_index": self.color_index,
+        }
+
+    def normalized_points(self):
+        points = []
+        for x, y in list(self.points or [])[:4]:
+            points.append((max(0.0, min(1.0, float(x))), float(y)))
+        fallback = [(0.0, 0.0), (0.30, 18.0), (0.70, 18.0), (1.0, 0.0)]
+        while len(points) < 4:
+            points.append(fallback[len(points)])
+        points[0] = (0.0, points[0][1])
+        points[3] = (1.0, points[3][1])
+        points[1] = (max(0.0, min(points[1][0], points[2][0], 1.0)), points[1][1])
+        points[2] = (max(points[1][0], min(points[2][0], 1.0)), points[2][1])
+        if _reference_metric_name(self.metric) == "bend":
+            points = [(x, max(0.0, y)) for x, y in points]
+        return points
+
+    def normalized_peaks(self):
+        metric = _reference_metric_name(self.metric)
+        peaks = []
+        for peak in list(self.peaks or []):
+            if not isinstance(peak, dict):
+                continue
+            try:
+                center = max(0.0, min(1.0, float(peak.get("center", 0.5))))
+                height = float(peak.get("height", 18.0 if metric == "bend" else 8.0))
+                width = max(0.02, min(1.0, float(peak.get("width", 0.18))))
+                sharpness = max(0.25, min(4.0, float(peak.get("sharpness", 1.0))))
+            except Exception:
+                continue
+            if metric == "bend":
+                height = max(0.0, height)
+            peaks.append(
+                {
+                    "center": center,
+                    "height": height,
+                    "width": width,
+                    "sharpness": sharpness,
+                }
+            )
+        return peaks
+
+    def value_at(self, x):
+        metric = _reference_metric_name(self.metric)
+        if _reference_profile_mode(self.profile_mode) == "bezier":
+            return self._bezier_value_at(x)
+        value = float(self.baseline)
+        x = max(0.0, min(1.0, float(x)))
+        for peak in self.normalized_peaks():
+            distance = abs(x - peak["center"]) / max(0.001, peak["width"])
+            if distance > 1.0:
+                continue
+            falloff = 0.5 + 0.5 * math.cos(math.pi * distance)
+            falloff = math.pow(max(0.0, min(1.0, falloff)), peak["sharpness"])
+            value += peak["height"] * falloff
+        return max(0.0, value) if metric == "bend" else value
+
+    def _bezier_point(self, t):
+        points = self.normalized_points()
+        t = max(0.0, min(1.0, float(t)))
+        inv = 1.0 - t
+        weights = (inv * inv * inv, 3.0 * inv * inv * t, 3.0 * inv * t * t, t * t * t)
+        x = sum(points[index][0] * weights[index] for index in range(4))
+        y = sum(points[index][1] * weights[index] for index in range(4))
+        return x, y
+
+    def _bezier_value_at(self, x):
+        samples = [self._bezier_point(index / 80.0) for index in range(81)]
+        x = max(0.0, min(1.0, float(x)))
+        previous = samples[0]
+        for current in samples[1:]:
+            if previous[0] <= x <= current[0] or current[0] <= x <= previous[0]:
+                span = current[0] - previous[0]
+                ratio = 0.0 if abs(span) < 0.0001 else (x - previous[0]) / span
+                value = previous[1] + (current[1] - previous[1]) * ratio
+                return max(0.0, value) if _reference_metric_name(self.metric) == "bend" else value
+            previous = current
+        value = samples[-1][1]
+        return max(0.0, value) if _reference_metric_name(self.metric) == "bend" else value
+
+    def sampled_profile(self, sample_count=80):
+        sample_count = max(2, int(sample_count))
+        if _reference_profile_mode(self.profile_mode) == "bezier":
+            return [self._bezier_point(index / float(sample_count - 1)) for index in range(sample_count)]
+        return [
+            (index / float(sample_count - 1), self.value_at(index / float(sample_count - 1)))
+            for index in range(sample_count)
+        ]
+
+    @classmethod
+    def from_dict(cls, data):
+        metric = _reference_metric_name(data.get("metric"))
+        points = []
+        for point in list(data.get("points") or [])[:4]:
+            try:
+                x, y = point
+                points.append((float(x), float(y)))
+            except Exception:
+                pass
+        try:
+            baseline = float(data.get("baseline", 0.0))
+        except Exception:
+            baseline = 0.0
+        if metric == "bend":
+            baseline = max(0.0, baseline)
+        return cls(
+            label=str(data.get("label") or "参照カーブ"),
+            metric=metric,
+            points=points or _default_reference_points(metric),
+            profile_mode=_reference_profile_mode(data.get("profile_mode")),
+            peaks=[
+                dict(item)
+                for item in list(data.get("peaks") or [])
+                if isinstance(item, dict)
+            ],
+            baseline=baseline,
+            visible=bool(data.get("visible", True)),
+            color_index=int(data.get("color_index", 0)),
+        )
+
+
+@dataclass
 class ChainData:
     label: str
     joints: list[str]
@@ -481,6 +648,7 @@ class ChainData:
     visible: bool = True
     color_index: int = 0
     twist_axis_overrides: dict[str, str] = field(default_factory=dict)
+    reference_curves: list[ReferenceCurveData] = field(default_factory=list)
     last_score: float = 0.0
     problem_joints: list[str] = field(default_factory=list)
 
@@ -492,6 +660,7 @@ class ChainData:
             "visible": self.visible,
             "color_index": self.color_index,
             "twist_axis_overrides": self.twist_axis_overrides,
+            "reference_curves": [curve.to_dict() for curve in self.reference_curves],
         }
 
     @classmethod
@@ -508,6 +677,11 @@ class ChainData:
             visible=bool(data.get("visible", True)),
             color_index=int(data.get("color_index", 0)),
             twist_axis_overrides=overrides,
+            reference_curves=[
+                ReferenceCurveData.from_dict(item)
+                for item in list(data.get("reference_curves") or [])
+                if isinstance(item, dict)
+            ],
         )
 
 
@@ -665,6 +839,7 @@ class BendGraphWidget(QtWidgets.QWidget):
     ):
         super().__init__(parent)
         self.rows = []
+        self.reference_curves = []
         self.threshold = 15.0
         self.value_key = value_key
         self.label = label
@@ -684,6 +859,10 @@ class BendGraphWidget(QtWidgets.QWidget):
             self.highlight_index = None
         self.update()
 
+    def set_reference_curves(self, curves):
+        self.reference_curves = list(curves or [])
+        self.update()
+
     def set_highlight_index(self, index):
         if index is None or not (0 <= index < len(self.rows)):
             self.highlight_index = None
@@ -701,8 +880,15 @@ class BendGraphWidget(QtWidgets.QWidget):
         if self.drag_max_value is not None:
             return self.drag_max_value
         values = [self._row_value(row) for row in self.rows]
+        for curve in self.reference_curves:
+            try:
+                values.extend(value for _x, value in curve.sampled_profile(80))
+            except Exception:
+                pass
         if self.signed:
             values = [abs(value) for value in values]
+        else:
+            values = [max(0.0, value) for value in values]
         max_value = max(values + [self.threshold * 2.0, 1.0])
         return max(self.min_display_value, math.ceil(max_value * 1.25 / 10.0) * 10.0)
 
@@ -722,6 +908,17 @@ class BendGraphWidget(QtWidgets.QWidget):
             y = center - (value / max_value) * (plot.height() * 0.5)
         else:
             y = plot.bottom() - (value / max_value) * plot.height()
+        return QtCore.QPointF(x, y)
+
+    def _point_at_ratio(self, ratio, value):
+        plot = self._plot_rect()
+        max_value = self._max_value()
+        x = plot.left() + max(0.0, min(1.0, float(ratio))) * plot.width()
+        if self.signed:
+            center = plot.center().y()
+            y = center - (value / max_value) * (plot.height() * 0.5)
+        else:
+            y = plot.bottom() - (max(0.0, value) / max_value) * plot.height()
         return QtCore.QPointF(x, y)
 
     def _value_from_y(self, y):
@@ -800,6 +997,25 @@ class BendGraphWidget(QtWidgets.QWidget):
             threshold_y = plot.bottom() - (self.threshold / max_value) * plot.height()
             painter.drawLine(QtCore.QPointF(plot.left(), threshold_y), QtCore.QPointF(plot.right(), threshold_y))
 
+        for curve in self.reference_curves:
+            samples = curve.sampled_profile(120)
+            if not samples:
+                continue
+            reference_path = QtGui.QPainterPath()
+            for index, (x, value) in enumerate(samples):
+                p = self._point_at_ratio(x, value)
+                if index == 0:
+                    reference_path.moveTo(p)
+                else:
+                    reference_path.lineTo(p)
+            color = QtGui.QColor.fromRgbF(*COLORS[curve.color_index % len(COLORS)])
+            painter.setPen(QtGui.QPen(color, 2, QtCore.Qt.DashLine))
+            painter.drawPath(reference_path)
+            if curve.label:
+                end_point = self._point_at_ratio(samples[-1][0], samples[-1][1])
+                painter.setPen(color)
+                painter.drawText(end_point + QtCore.QPointF(-90, -6), curve.label[:14])
+
         path = QtGui.QPainterPath()
         for index, value in enumerate(values):
             p = self._point(index, value)
@@ -830,6 +1046,9 @@ class BendGraphWidget(QtWidgets.QWidget):
         painter.drawText(QtCore.QPointF(plot.left(), rect.bottom() - 13), "%s（点を上下ドラッグで調整）" % self.label)
         painter.setPen(QtGui.QColor(225, 90, 80))
         painter.drawText(QtCore.QPointF(plot.left() + 190, rect.bottom() - 13), "しきい値超え")
+        if self.reference_curves:
+            painter.setPen(QtGui.QColor(170, 174, 182))
+            painter.drawText(QtCore.QPointF(plot.left() + 285, rect.bottom() - 13), "破線: 参照曲線")
 
         painter.setPen(QtGui.QColor(170, 174, 182))
         painter.drawText(QtCore.QPointF(8, plot.top() + 10), "%.0f" % max_value)
@@ -838,6 +1057,543 @@ class BendGraphWidget(QtWidgets.QWidget):
             painter.drawText(QtCore.QPointF(12, plot.center().y() - 2), "0")
         else:
             painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
+
+
+class ReferenceCurveWidget(QtWidgets.QWidget):
+    curveChanged = QtCore.Signal(list)
+    curveEditFinished = QtCore.Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.points = [(0.0, 0.0), (0.30, 18.0), (0.70, 18.0), (1.0, 0.0)]
+        self.metric = "bend"
+        self.drag_index = None
+        self.selected_index = None
+        self.min_display_value = 50.0
+        self.setMinimumHeight(230)
+        self.setMouseTracking(True)
+
+    def set_metric(self, metric):
+        self.metric = _reference_metric_name(metric)
+        self.min_display_value = 10.0 if self.metric == "twist" else 50.0
+        if self.metric == "bend":
+            self.points = [(x, max(0.0, y)) for x, y in self.points]
+        self.update()
+
+    def set_curve_points(self, points):
+        curve = ReferenceCurveData(label="_", metric=self.metric, points=points)
+        self.points = curve.normalized_points()
+        if self.metric == "bend":
+            self.points = [(x, max(0.0, y)) for x, y in self.points]
+        self.selected_index = None
+        self.drag_index = None
+        self.update()
+
+    def curve_points(self):
+        return [(float(x), float(y)) for x, y in self.points]
+
+    def _event_pos(self, event):
+        return event.position() if hasattr(event, "position") else QtCore.QPointF(event.x(), event.y())
+
+    def _plot_rect(self):
+        return self.rect().adjusted(44, 18, -18, -34)
+
+    def _is_signed(self):
+        return self.metric == "twist"
+
+    def _max_value(self):
+        values = [abs(y) if self._is_signed() else max(0.0, y) for _x, y in self.points]
+        max_value = max(values + [1.0])
+        return max(self.min_display_value, math.ceil(max_value * 1.25 / 10.0) * 10.0)
+
+    def _point(self, x, value):
+        plot = self._plot_rect()
+        max_value = self._max_value()
+        px = plot.left() + max(0.0, min(1.0, x)) * plot.width()
+        if self._is_signed():
+            py = plot.center().y() - (value / max_value) * (plot.height() * 0.5)
+        else:
+            py = plot.bottom() - (max(0.0, value) / max_value) * plot.height()
+        return QtCore.QPointF(px, py)
+
+    def _curve_point_from_pos(self, pos):
+        plot = self._plot_rect()
+        max_value = self._max_value()
+        x = (pos.x() - plot.left()) / max(1.0, plot.width())
+        x = max(0.0, min(1.0, x))
+        y = max(plot.top(), min(plot.bottom(), pos.y()))
+        if self._is_signed():
+            center = plot.center().y()
+            value = (center - y) / max(1.0, plot.height() * 0.5) * max_value
+        else:
+            value = max(0.0, (plot.bottom() - y) / max(1.0, plot.height()) * max_value)
+        return x, value
+
+    def _nearest_point_index(self, pos):
+        best_index = None
+        best_distance = 999999.0
+        for index, point in enumerate(self.points):
+            p = self._point(point[0], point[1])
+            distance = math.hypot(pos.x() - p.x(), pos.y() - p.y())
+            if distance < best_distance:
+                best_index = index
+                best_distance = distance
+        return best_index if best_distance <= 14.0 else None
+
+    def _set_point_from_pos(self, index, pos):
+        x, y = self._curve_point_from_pos(pos)
+        points = list(self.points)
+        if index == 0:
+            x = 0.0
+        elif index == 3:
+            x = 1.0
+        elif index == 1:
+            x = max(0.0, min(x, points[2][0]))
+        elif index == 2:
+            x = max(points[1][0], min(x, 1.0))
+        if not self._is_signed():
+            y = max(0.0, y)
+        points[index] = (x, y)
+        self.points = points
+        self.selected_index = index
+        self.curveChanged.emit(self.curve_points())
+        self.update()
+
+    def mousePressEvent(self, event):
+        pos = self._event_pos(event)
+        index = self._nearest_point_index(pos)
+        if index is None:
+            return
+        self.drag_index = index
+        self._set_point_from_pos(index, pos)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_index is None:
+            return
+        self._set_point_from_pos(self.drag_index, self._event_pos(event))
+
+    def mouseReleaseEvent(self, event):
+        if self.drag_index is not None:
+            self.curveEditFinished.emit(self.curve_points())
+        self.drag_index = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QtGui.QColor(28, 30, 34))
+        plot = self._plot_rect()
+        painter.setPen(QtGui.QColor(86, 90, 98))
+        painter.drawRect(plot)
+
+        max_value = self._max_value()
+        painter.setPen(QtGui.QColor(120, 125, 135))
+        if self._is_signed():
+            center_y = plot.center().y()
+            painter.drawLine(QtCore.QPointF(plot.left(), center_y), QtCore.QPointF(plot.right(), center_y))
+        painter.drawText(QtCore.QPointF(8, plot.top() + 10), "%.0f" % max_value)
+        if self._is_signed():
+            painter.drawText(QtCore.QPointF(8, plot.bottom()), "%.0f" % -max_value)
+            painter.drawText(QtCore.QPointF(12, plot.center().y() - 2), "0")
+        else:
+            painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
+
+        screen_points = [self._point(x, y) for x, y in self.points]
+        painter.setPen(QtGui.QPen(QtGui.QColor(115, 122, 132), 1, QtCore.Qt.DashLine))
+        painter.drawLine(screen_points[0], screen_points[1])
+        painter.drawLine(screen_points[2], screen_points[3])
+
+        path = QtGui.QPainterPath()
+        path.moveTo(screen_points[0])
+        path.cubicTo(screen_points[1], screen_points[2], screen_points[3])
+        painter.setPen(QtGui.QPen(QtGui.QColor(245, 190, 75), 2))
+        painter.drawPath(path)
+
+        for index, point in enumerate(screen_points):
+            selected = index == self.selected_index
+            color = QtGui.QColor(95, 190, 255) if selected else QtGui.QColor(245, 190, 75)
+            painter.setBrush(color)
+            painter.setPen(color)
+            radius = 6 if index in (0, 3) else 5
+            painter.drawEllipse(point, radius, radius)
+
+        painter.setPen(QtGui.QColor(170, 174, 182))
+        painter.drawText(QtCore.QPointF(plot.left(), rect.bottom() - 13), "Root")
+        painter.drawText(QtCore.QPointF(plot.right() - 20, rect.bottom() - 13), "Tip")
+
+
+class PeakCurveWidget(QtWidgets.QWidget):
+    peaksChanged = QtCore.Signal(list)
+    peakEditFinished = QtCore.Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.metric = "bend"
+        self.baseline = 0.0
+        self.peaks = _default_reference_peaks("bend")
+        self.drag_target = None
+        self.selected_peak = None
+        self.min_display_value = 50.0
+        self.setMinimumHeight(230)
+        self.setMouseTracking(True)
+
+    def set_profile(self, metric, peaks, baseline=0.0):
+        self.metric = _reference_metric_name(metric)
+        self.min_display_value = 10.0 if self.metric == "twist" else 50.0
+        self.baseline = max(0.0, float(baseline)) if self.metric == "bend" else float(baseline)
+        data = ReferenceCurveData(label="_", metric=self.metric, peaks=peaks, baseline=self.baseline)
+        self.peaks = data.normalized_peaks()
+        self.drag_target = None
+        self.selected_peak = None
+        self.update()
+
+    def curve_peaks(self):
+        data = ReferenceCurveData(label="_", metric=self.metric, peaks=self.peaks, baseline=self.baseline)
+        return data.normalized_peaks()
+
+    def selected_peak_index(self):
+        if self.selected_peak is not None and 0 <= self.selected_peak < len(self.peaks):
+            return self.selected_peak
+        return -1
+
+    def add_peak(self, center=None, height=None, width=0.18):
+        if center is None:
+            if self.peaks:
+                center = min(0.9, max(0.1, sum(peak["center"] for peak in self.peaks) / len(self.peaks) + 0.15))
+            else:
+                center = 0.5
+        if height is None:
+            height = 8.0 if self.metric == "twist" else 18.0
+        peak = {
+            "center": max(0.0, min(1.0, float(center))),
+            "height": max(0.0, float(height)) if self.metric == "bend" else float(height),
+            "width": max(0.02, min(1.0, float(width))),
+            "sharpness": 1.0,
+        }
+        self.peaks.append(peak)
+        self.selected_peak = len(self.peaks) - 1
+        self._emit_peaks_changed(finished=True)
+
+    def delete_selected_peak(self):
+        index = self.selected_peak_index()
+        if index < 0:
+            return False
+        self.peaks.pop(index)
+        self.selected_peak = min(index, len(self.peaks) - 1) if self.peaks else None
+        self._emit_peaks_changed(finished=True)
+        return True
+
+    def _event_pos(self, event):
+        return event.position() if hasattr(event, "position") else QtCore.QPointF(event.x(), event.y())
+
+    def _plot_rect(self):
+        return self.rect().adjusted(44, 18, -18, -34)
+
+    def _is_signed(self):
+        return self.metric == "twist"
+
+    def _profile_data(self):
+        return ReferenceCurveData(
+            label="_",
+            metric=self.metric,
+            profile_mode="peaks",
+            peaks=self.peaks,
+            baseline=self.baseline,
+        )
+
+    def _max_value(self):
+        samples = [value for _x, value in self._profile_data().sampled_profile(90)]
+        for peak in self.peaks:
+            samples.append(self.baseline + peak["height"])
+            samples.append(self.baseline)
+        values = [abs(value) if self._is_signed() else max(0.0, value) for value in samples]
+        return max(self.min_display_value, math.ceil(max(values + [1.0]) * 1.25 / 10.0) * 10.0)
+
+    def _point(self, x, value):
+        plot = self._plot_rect()
+        max_value = self._max_value()
+        px = plot.left() + max(0.0, min(1.0, x)) * plot.width()
+        if self._is_signed():
+            py = plot.center().y() - (value / max_value) * (plot.height() * 0.5)
+        else:
+            py = plot.bottom() - (max(0.0, value) / max_value) * plot.height()
+        return QtCore.QPointF(px, py)
+
+    def _x_value_from_pos(self, pos):
+        plot = self._plot_rect()
+        max_value = self._max_value()
+        x = (pos.x() - plot.left()) / max(1.0, plot.width())
+        x = max(0.0, min(1.0, x))
+        y = max(plot.top(), min(plot.bottom(), pos.y()))
+        if self._is_signed():
+            center = plot.center().y()
+            value = (center - y) / max(1.0, plot.height() * 0.5) * max_value
+        else:
+            value = max(0.0, (plot.bottom() - y) / max(1.0, plot.height()) * max_value)
+        return x, value
+
+    def _handle_points(self, peak):
+        center = peak["center"]
+        width = peak["width"]
+        top = self._point(center, self.baseline + peak["height"])
+        left = self._point(max(0.0, center - width), self.baseline)
+        right = self._point(min(1.0, center + width), self.baseline)
+        return top, left, right
+
+    def _nearest_handle(self, pos):
+        best = None
+        best_distance = 999999.0
+        for index, peak in enumerate(self.peaks):
+            for kind, handle in zip(("center", "left", "right"), self._handle_points(peak)):
+                distance = math.hypot(pos.x() - handle.x(), pos.y() - handle.y())
+                if distance < best_distance:
+                    best = (index, kind)
+                    best_distance = distance
+        return best if best_distance <= 14.0 else None
+
+    def _set_peak_from_pos(self, target, pos):
+        index, kind = target
+        if not (0 <= index < len(self.peaks)):
+            return
+        x, value = self._x_value_from_pos(pos)
+        peak = dict(self.peaks[index])
+        if kind == "center":
+            peak["center"] = x
+            height = value - self.baseline
+            peak["height"] = max(0.0, height) if self.metric == "bend" else height
+        else:
+            peak["width"] = max(0.02, min(1.0, abs(x - peak["center"])))
+        self.peaks[index] = peak
+        self.selected_peak = index
+        self._emit_peaks_changed(finished=False)
+
+    def _emit_peaks_changed(self, finished=False):
+        self.peaks = self.curve_peaks()
+        self.peaksChanged.emit(self.curve_peaks())
+        if finished:
+            self.peakEditFinished.emit(self.curve_peaks())
+        self.update()
+
+    def mousePressEvent(self, event):
+        pos = self._event_pos(event)
+        target = self._nearest_handle(pos)
+        if target is None:
+            return
+        self.drag_target = target
+        self._set_peak_from_pos(target, pos)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_target is None:
+            return
+        self._set_peak_from_pos(self.drag_target, self._event_pos(event))
+
+    def mouseReleaseEvent(self, event):
+        if self.drag_target is not None:
+            self.peakEditFinished.emit(self.curve_peaks())
+        self.drag_target = None
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        x, value = self._x_value_from_pos(self._event_pos(event))
+        self.add_peak(center=x, height=value - self.baseline)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QtGui.QColor(28, 30, 34))
+        plot = self._plot_rect()
+        painter.setPen(QtGui.QColor(86, 90, 98))
+        painter.drawRect(plot)
+
+        max_value = self._max_value()
+        painter.setPen(QtGui.QColor(120, 125, 135))
+        if self._is_signed():
+            zero_y = self._point(0.0, 0.0).y()
+            painter.drawLine(QtCore.QPointF(plot.left(), zero_y), QtCore.QPointF(plot.right(), zero_y))
+        baseline_y = self._point(0.0, self.baseline).y()
+        painter.setPen(QtGui.QPen(QtGui.QColor(135, 138, 146), 1, QtCore.Qt.DashLine))
+        painter.drawLine(QtCore.QPointF(plot.left(), baseline_y), QtCore.QPointF(plot.right(), baseline_y))
+
+        painter.setPen(QtGui.QColor(170, 174, 182))
+        painter.drawText(QtCore.QPointF(8, plot.top() + 10), "%.0f" % max_value)
+        if self._is_signed():
+            painter.drawText(QtCore.QPointF(8, plot.bottom()), "%.0f" % -max_value)
+            painter.drawText(QtCore.QPointF(12, self._point(0.0, 0.0).y() - 2), "0")
+        else:
+            painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
+
+        samples = self._profile_data().sampled_profile(100)
+        path = QtGui.QPainterPath()
+        for index, (x, value) in enumerate(samples):
+            point = self._point(x, value)
+            if index == 0:
+                path.moveTo(point)
+            else:
+                path.lineTo(point)
+        painter.setPen(QtGui.QPen(QtGui.QColor(245, 190, 75), 2))
+        painter.drawPath(path)
+
+        for index, peak in enumerate(self.peaks):
+            selected = index == self.selected_peak
+            top, left, right = self._handle_points(peak)
+            painter.setPen(QtGui.QPen(QtGui.QColor(115, 122, 132), 1, QtCore.Qt.DashLine))
+            painter.drawLine(left, right)
+            painter.drawLine(top, QtCore.QPointF(top.x(), baseline_y))
+            color = QtGui.QColor(95, 190, 255) if selected else QtGui.QColor(245, 190, 75)
+            painter.setBrush(color)
+            painter.setPen(color)
+            painter.drawEllipse(top, 6, 6)
+            painter.setBrush(QtGui.QColor(170, 174, 182))
+            painter.setPen(QtGui.QColor(170, 174, 182))
+            painter.drawRect(QtCore.QRectF(left.x() - 4, left.y() - 4, 8, 8))
+            painter.drawRect(QtCore.QRectF(right.x() - 4, right.y() - 4, 8, 8))
+
+        painter.setPen(QtGui.QColor(170, 174, 182))
+        painter.drawText(QtCore.QPointF(plot.left(), rect.bottom() - 13), "Root")
+        painter.drawText(QtCore.QPointF(plot.right() - 20, rect.bottom() - 13), "Tip")
+
+
+class ReferenceCurvePreviewWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.curve = None
+        self.other_curves = []
+        self.metric = "bend"
+        self.min_display_value = 50.0
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+
+    def sizeHint(self):
+        return QtCore.QSize(520, 260)
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(280, 200)
+
+    def clear(self):
+        self.curve = None
+        self.other_curves = []
+        self.metric = "bend"
+        self.min_display_value = 50.0
+        self.update()
+
+    def set_curves(self, curve, other_curves=None, metric=None):
+        self.curve = curve
+        self.other_curves = list(other_curves or [])
+        self.metric = _reference_metric_name(metric or (curve.metric if curve else "bend"))
+        self.min_display_value = 10.0 if self.metric == "twist" else 50.0
+        self.update()
+
+    def _plot_rect(self):
+        plot = self.rect().adjusted(44, 18, -18, -30)
+        if plot.width() < 40 or plot.height() < 30:
+            return self.rect().adjusted(8, 8, -8, -8)
+        return plot
+
+    def _is_signed(self):
+        return self.metric == "twist"
+
+    def _display_curves(self):
+        curves = list(self.other_curves)
+        if self.curve is not None:
+            curves.append(self.curve)
+        return curves
+
+    def _max_value(self):
+        samples = []
+        for curve in self._display_curves():
+            samples.extend(value for _x, value in curve.sampled_profile(120))
+            if _reference_profile_mode(curve.profile_mode) == "peaks":
+                samples.append(float(curve.baseline))
+        values = [abs(value) if self._is_signed() else max(0.0, value) for value in samples]
+        return max(self.min_display_value, math.ceil(max(values + [1.0]) * 1.25 / 10.0) * 10.0)
+
+    def _point(self, x, value):
+        plot = self._plot_rect()
+        max_value = self._max_value()
+        px = plot.left() + max(0.0, min(1.0, x)) * plot.width()
+        if self._is_signed():
+            py = plot.center().y() - (value / max_value) * (plot.height() * 0.5)
+        else:
+            py = plot.bottom() - (max(0.0, value) / max_value) * plot.height()
+        return QtCore.QPointF(px, py)
+
+    def _draw_curve(self, painter, curve, color, style=QtCore.Qt.SolidLine, width=2):
+        samples = curve.sampled_profile(120)
+        if not samples:
+            return
+        path = QtGui.QPainterPath()
+        for index, (x, value) in enumerate(samples):
+            point = self._point(x, value)
+            if index == 0:
+                path.moveTo(point)
+            else:
+                path.lineTo(point)
+        painter.setPen(QtGui.QPen(color, width, style))
+        painter.drawPath(path)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QtGui.QColor(28, 30, 34))
+        plot = self._plot_rect()
+
+        painter.setPen(QtGui.QColor(86, 90, 98))
+        painter.drawRect(plot)
+
+        max_value = self._max_value()
+        painter.setPen(QtGui.QPen(QtGui.QColor(52, 56, 64), 1))
+        for step in range(1, 4):
+            x = plot.left() + plot.width() * (step / 4.0)
+            painter.drawLine(QtCore.QPointF(x, plot.top()), QtCore.QPointF(x, plot.bottom()))
+        for step in range(1, 4):
+            y = plot.top() + plot.height() * (step / 4.0)
+            painter.drawLine(QtCore.QPointF(plot.left(), y), QtCore.QPointF(plot.right(), y))
+
+        painter.setPen(QtGui.QColor(120, 125, 135))
+        if self._is_signed():
+            zero_y = self._point(0.0, 0.0).y()
+            painter.drawLine(QtCore.QPointF(plot.left(), zero_y), QtCore.QPointF(plot.right(), zero_y))
+        if self.curve is not None and _reference_profile_mode(self.curve.profile_mode) == "peaks":
+            baseline_y = self._point(0.0, self.curve.baseline).y()
+            painter.setPen(QtGui.QPen(QtGui.QColor(135, 138, 146), 1, QtCore.Qt.DashLine))
+            painter.drawLine(QtCore.QPointF(plot.left(), baseline_y), QtCore.QPointF(plot.right(), baseline_y))
+
+        painter.setPen(QtGui.QColor(170, 174, 182))
+        painter.drawText(QtCore.QPointF(8, plot.top() + 10), "%.0f" % max_value)
+        if self._is_signed():
+            painter.drawText(QtCore.QPointF(8, plot.bottom()), "%.0f" % -max_value)
+            painter.drawText(QtCore.QPointF(12, self._point(0.0, 0.0).y() - 2), "0")
+        else:
+            painter.drawText(QtCore.QPointF(12, plot.bottom()), "0")
+
+        if self.curve is None:
+            painter.setPen(QtGui.QColor(145, 149, 158))
+            painter.drawText(plot, QtCore.Qt.AlignCenter, "曲線を選択してください")
+        else:
+            for curve in self.other_curves:
+                color = QtGui.QColor.fromRgbF(*COLORS[curve.color_index % len(COLORS)])
+                color.setAlpha(90)
+                self._draw_curve(painter, curve, color, QtCore.Qt.DashLine, 1)
+            color = QtGui.QColor.fromRgbF(*COLORS[self.curve.color_index % len(COLORS)])
+            color.setAlpha(235 if self.curve.visible else 150)
+            style = QtCore.Qt.SolidLine if self.curve.visible else QtCore.Qt.DashLine
+            self._draw_curve(painter, self.curve, color, style, 3)
+
+            metric_label = "ねじれ" if self.metric == "twist" else "曲がり"
+            mode_label = "山調整" if _reference_profile_mode(self.curve.profile_mode) == "peaks" else "ベジェ"
+            state_label = "表示ON" if self.curve.visible else "表示OFF"
+            painter.setPen(QtGui.QColor(220, 224, 232))
+            painter.drawText(
+                QtCore.QPointF(plot.left(), plot.top() - 4),
+                "編集結果: %s / %s・%s / %s" % (self.curve.label, metric_label, mode_label, state_label),
+            )
+
+        painter.setPen(QtGui.QColor(170, 174, 182))
+        painter.drawText(QtCore.QPointF(plot.left(), rect.bottom() - 11), "Root")
+        painter.drawText(QtCore.QPointF(plot.right() - 20, rect.bottom() - 11), "Tip")
 
 
 class TailCodeTATool(QtWidgets.QDialog):
@@ -863,6 +1619,7 @@ class TailCodeTATool(QtWidgets.QDialog):
         self._graph_edit_redo_stack = []
         self._live_graph_drag_snapshot = None
         self._live_twist_drag = None
+        self._syncing_reference_curve_controls = False
         self.graph_undo_open = False
         self._build_ui()
         self._install_undo_redo_shortcuts()
@@ -1084,6 +1841,9 @@ class TailCodeTATool(QtWidgets.QDialog):
 
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
+        self.detail_tabs = QtWidgets.QTabWidget()
+        graph_page = QtWidgets.QWidget()
+        graph_layout = QtWidgets.QVBoxLayout(graph_page)
         self.score_label = QtWidgets.QLabel("曲がりスコア: -")
         self.angle_table = QtWidgets.QTableWidget(0, 12)
         self.angle_table.setHorizontalHeaderLabels(
@@ -1136,13 +1896,16 @@ class TailCodeTATool(QtWidgets.QDialog):
         self.twist_graph.bendEditStarted.connect(self.begin_graph_undo)
         self.twist_graph.bendEdited.connect(self.apply_twist_edit)
         self.twist_graph.bendEditFinished.connect(self.end_graph_undo)
-        right_layout.addWidget(self.score_label)
-        right_layout.addLayout(axis_layout)
-        right_layout.addWidget(self.angle_table)
-        right_layout.addWidget(QtWidgets.QLabel("現在フレームの曲がり折れ線グラフ"))
-        right_layout.addWidget(self.angle_graph)
-        right_layout.addWidget(QtWidgets.QLabel("現在フレームのねじれグラフ"))
-        right_layout.addWidget(self.twist_graph)
+        graph_layout.addWidget(self.score_label)
+        graph_layout.addLayout(axis_layout)
+        graph_layout.addWidget(self.angle_table)
+        graph_layout.addWidget(QtWidgets.QLabel("現在フレームの曲がり折れ線グラフ"))
+        graph_layout.addWidget(self.angle_graph)
+        graph_layout.addWidget(QtWidgets.QLabel("現在フレームのねじれグラフ"))
+        graph_layout.addWidget(self.twist_graph)
+        self.detail_tabs.addTab(graph_page, "グラフ調整")
+        self.detail_tabs.addTab(self._build_reference_curve_tab(), "参照曲線")
+        right_layout.addWidget(self.detail_tabs)
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 2)
         main.addWidget(splitter, 1)
@@ -1181,6 +1944,502 @@ class TailCodeTATool(QtWidgets.QDialog):
         tweaker_layout.addWidget(self.tweaker_status, 1, 0, 1, 2)
         main.addWidget(tweaker_box)
         self.cancel_scan = False
+
+    def _build_reference_curve_tab(self):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+
+        top_layout = QtWidgets.QHBoxLayout()
+        list_layout = QtWidgets.QVBoxLayout()
+        self.reference_curve_list = QtWidgets.QListWidget()
+        self.reference_curve_list.currentRowChanged.connect(self.on_reference_curve_selected)
+        list_layout.addWidget(QtWidgets.QLabel("保存曲線"))
+        list_layout.addWidget(self.reference_curve_list)
+        top_layout.addLayout(list_layout, 1)
+
+        form_layout = QtWidgets.QGridLayout()
+        self.reference_curve_label_edit = QtWidgets.QLineEdit()
+        self.reference_curve_metric_combo = QtWidgets.QComboBox()
+        self.reference_curve_metric_combo.addItem("曲がり", "bend")
+        self.reference_curve_metric_combo.addItem("ねじれ", "twist")
+        self.reference_curve_metric_combo.currentIndexChanged.connect(self.on_reference_curve_metric_changed)
+        self.reference_curve_visible_check = QtWidgets.QCheckBox("表示")
+        self.reference_curve_visible_check.toggled.connect(self.on_reference_curve_visible_changed)
+        self.reference_curve_mode_combo = QtWidgets.QComboBox()
+        self.reference_curve_mode_combo.addItem("ベジェ編集", "bezier")
+        self.reference_curve_mode_combo.addItem("山調整", "peaks")
+        self.reference_curve_mode_combo.currentIndexChanged.connect(self.on_reference_curve_mode_changed)
+        self.reference_curve_baseline_spin = QtWidgets.QDoubleSpinBox()
+        self.reference_curve_baseline_spin.setRange(-999.0, 999.0)
+        self.reference_curve_baseline_spin.setDecimals(2)
+        self.reference_curve_baseline_spin.setSuffix(" 度")
+        self.reference_curve_baseline_spin.valueChanged.connect(self.on_reference_curve_baseline_changed)
+        form_layout.addWidget(QtWidgets.QLabel("曲線ラベル"), 0, 0)
+        form_layout.addWidget(self.reference_curve_label_edit, 0, 1, 1, 3)
+        form_layout.addWidget(QtWidgets.QLabel("対象"), 1, 0)
+        form_layout.addWidget(self.reference_curve_metric_combo, 1, 1)
+        form_layout.addWidget(self.reference_curve_visible_check, 1, 2)
+        form_layout.addWidget(QtWidgets.QLabel("編集"), 2, 0)
+        form_layout.addWidget(self.reference_curve_mode_combo, 2, 1)
+        form_layout.addWidget(QtWidgets.QLabel("ベース"), 2, 2)
+        form_layout.addWidget(self.reference_curve_baseline_spin, 2, 3)
+        self.reference_curve_new_button = QtWidgets.QPushButton("新規")
+        self.reference_curve_save_button = QtWidgets.QPushButton("保存")
+        self.reference_curve_duplicate_button = QtWidgets.QPushButton("複製")
+        self.reference_curve_delete_button = QtWidgets.QPushButton("削除")
+        self.reference_curve_add_peak_button = QtWidgets.QPushButton("山を追加")
+        self.reference_curve_delete_peak_button = QtWidgets.QPushButton("山を削除")
+        self.reference_curve_new_button.clicked.connect(self.create_reference_curve)
+        self.reference_curve_save_button.clicked.connect(self.save_reference_curve)
+        self.reference_curve_duplicate_button.clicked.connect(self.duplicate_reference_curve)
+        self.reference_curve_delete_button.clicked.connect(self.delete_reference_curve)
+        self.reference_curve_add_peak_button.clicked.connect(self.add_reference_curve_peak)
+        self.reference_curve_delete_peak_button.clicked.connect(self.delete_reference_curve_peak)
+        form_layout.addWidget(self.reference_curve_new_button, 3, 0)
+        form_layout.addWidget(self.reference_curve_save_button, 3, 1)
+        form_layout.addWidget(self.reference_curve_duplicate_button, 3, 2)
+        form_layout.addWidget(self.reference_curve_delete_button, 3, 3)
+        form_layout.addWidget(self.reference_curve_add_peak_button, 4, 0, 1, 2)
+        form_layout.addWidget(self.reference_curve_delete_peak_button, 4, 2, 1, 2)
+        top_layout.addLayout(form_layout, 2)
+        layout.addLayout(top_layout)
+
+        self.reference_curve_editor_stack = QtWidgets.QStackedWidget()
+        self.reference_curve_editor = ReferenceCurveWidget()
+        self.reference_curve_editor.curveChanged.connect(self.on_reference_curve_points_changed)
+        self.reference_curve_editor.curveEditFinished.connect(self.on_reference_curve_edit_finished)
+        self.reference_peak_editor = PeakCurveWidget()
+        self.reference_peak_editor.peaksChanged.connect(self.on_reference_curve_peaks_changed)
+        self.reference_peak_editor.peakEditFinished.connect(self.on_reference_curve_peak_edit_finished)
+        self.reference_curve_editor_stack.addWidget(self.reference_curve_editor)
+        self.reference_curve_editor_stack.addWidget(self.reference_peak_editor)
+
+        graph_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        graph_splitter.setChildrenCollapsible(False)
+        editor_panel = QtWidgets.QWidget()
+        editor_layout = QtWidgets.QVBoxLayout(editor_panel)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.addWidget(QtWidgets.QLabel("編集用グラフ"))
+        editor_layout.addWidget(self.reference_curve_editor_stack)
+        preview_panel = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(QtWidgets.QLabel("編集結果グラフ"))
+        self.reference_curve_preview = ReferenceCurvePreviewWidget()
+        preview_layout.addWidget(self.reference_curve_preview)
+        graph_splitter.addWidget(editor_panel)
+        graph_splitter.addWidget(preview_panel)
+        graph_splitter.setStretchFactor(0, 3)
+        graph_splitter.setStretchFactor(1, 2)
+        graph_splitter.setSizes([300, 260])
+        layout.addWidget(graph_splitter, 1)
+
+        self.reference_curve_status = QtWidgets.QLabel("チェーンを選択してください。")
+        self.reference_curve_status.setWordWrap(True)
+        layout.addWidget(self.reference_curve_status)
+        return page
+
+    def _reference_metric_label(self, metric):
+        return "ねじれ" if _reference_metric_name(metric) == "twist" else "曲がり"
+
+    def _reference_profile_label(self, mode):
+        return "山" if _reference_profile_mode(mode) == "peaks" else "ベジェ"
+
+    def _current_reference_curve_mode(self):
+        if not hasattr(self, "reference_curve_mode_combo"):
+            return "bezier"
+        return _reference_profile_mode(
+            self.reference_curve_mode_combo.itemData(self.reference_curve_mode_combo.currentIndex())
+        )
+
+    def _selected_reference_curve_index(self):
+        chain = self._selected_chain()
+        row = self.reference_curve_list.currentRow() if hasattr(self, "reference_curve_list") else -1
+        if chain is not None and 0 <= row < len(chain.reference_curves):
+            return row
+        return -1
+
+    def _current_reference_curve(self):
+        chain = self._selected_chain()
+        index = self._selected_reference_curve_index()
+        if chain is not None and 0 <= index < len(chain.reference_curves):
+            return chain.reference_curves[index]
+        return None
+
+    def _sync_reference_curve_preview(self, chain=None, curve=None):
+        if not hasattr(self, "reference_curve_preview"):
+            return
+        if chain is None:
+            chain = self._selected_chain()
+        if curve is None:
+            curve = self._current_reference_curve()
+        if chain is None or curve is None:
+            self.reference_curve_preview.clear()
+            return
+        metric = _reference_metric_name(curve.metric)
+        other_curves = [
+            other
+            for other in chain.reference_curves
+            if other is not curve and other.visible and _reference_metric_name(other.metric) == metric
+        ]
+        self.reference_curve_preview.set_curves(curve, other_curves, metric)
+
+    def _sync_reference_curve_outputs(self, chain=None, curve=None):
+        if chain is None:
+            chain = self._selected_chain()
+        self._sync_reference_curve_preview(chain, curve)
+        self._sync_reference_graphs(chain, sync_preview=False)
+
+    def _unique_reference_curve_label(self, chain, label, exclude_index=None):
+        base = (label or "").strip() or "参照カーブ_%02d" % (len(chain.reference_curves) + 1)
+        used = {curve.label for i, curve in enumerate(chain.reference_curves) if i != exclude_index}
+        if base not in used:
+            return base
+        suffix = 2
+        while True:
+            candidate = "%s_%02d" % (base, suffix)
+            if candidate not in used:
+                return candidate
+            suffix += 1
+
+    def _set_reference_baseline_range(self, metric):
+        if not hasattr(self, "reference_curve_baseline_spin"):
+            return
+        if _reference_metric_name(metric) == "bend":
+            self.reference_curve_baseline_spin.setRange(0.0, 999.0)
+        else:
+            self.reference_curve_baseline_spin.setRange(-999.0, 999.0)
+
+    def _sync_reference_curve_mode_ui(self, has_curve=None):
+        if not hasattr(self, "reference_curve_editor_stack"):
+            return
+        if has_curve is None:
+            has_curve = self._selected_reference_curve_index() >= 0
+        mode = self._current_reference_curve_mode()
+        is_peaks = mode == "peaks"
+        self.reference_curve_editor_stack.setCurrentIndex(1 if is_peaks else 0)
+        self.reference_curve_editor.setEnabled(bool(has_curve and not is_peaks))
+        self.reference_peak_editor.setEnabled(bool(has_curve and is_peaks))
+        self.reference_curve_baseline_spin.setEnabled(bool(has_curve and is_peaks))
+        self.reference_curve_add_peak_button.setEnabled(bool(has_curve and is_peaks))
+        self.reference_curve_delete_peak_button.setEnabled(bool(has_curve and is_peaks))
+
+    def _set_reference_curve_controls_enabled(self, has_chain, has_curve):
+        if not hasattr(self, "reference_curve_editor"):
+            return
+        self.reference_curve_list.setEnabled(bool(has_chain))
+        self.reference_curve_new_button.setEnabled(bool(has_chain))
+        self.reference_curve_metric_combo.setEnabled(bool(has_chain))
+        self.reference_curve_mode_combo.setEnabled(bool(has_chain))
+        for widget in (
+            self.reference_curve_label_edit,
+            self.reference_curve_visible_check,
+            self.reference_curve_save_button,
+            self.reference_curve_duplicate_button,
+            self.reference_curve_delete_button,
+            self.reference_curve_editor_stack,
+        ):
+            widget.setEnabled(bool(has_curve))
+        self._sync_reference_curve_mode_ui(has_curve=has_curve)
+
+    def _sync_reference_curve_controls(self, select_index=None):
+        if not hasattr(self, "reference_curve_list"):
+            return
+        chain = self._selected_chain()
+        current_row = self.reference_curve_list.currentRow()
+        self._syncing_reference_curve_controls = True
+        try:
+            self.reference_curve_list.clear()
+            if chain is None:
+                self.reference_curve_label_edit.clear()
+                self.reference_curve_metric_combo.setCurrentIndex(0)
+                self.reference_curve_visible_check.setChecked(False)
+                self.reference_curve_mode_combo.setCurrentIndex(0)
+                self.reference_curve_baseline_spin.setValue(0.0)
+                self.reference_curve_editor.set_metric("bend")
+                self.reference_curve_editor.set_curve_points(_default_reference_points("bend"))
+                self.reference_peak_editor.set_profile("bend", _default_reference_peaks("bend"), 0.0)
+                self._set_reference_curve_controls_enabled(False, False)
+                self._sync_reference_curve_preview(None, None)
+                self.reference_curve_status.setText("チェーンを選択してください。")
+                return
+
+            for index, curve in enumerate(chain.reference_curves):
+                state = "ON" if curve.visible else "OFF"
+                item = QtWidgets.QListWidgetItem(
+                    "%02d  %s  /  %s・%s  [%s]"
+                    % (
+                        index + 1,
+                        curve.label,
+                        self._reference_metric_label(curve.metric),
+                        self._reference_profile_label(curve.profile_mode),
+                        state,
+                    )
+                )
+                item.setData(QtCore.Qt.UserRole, index)
+                color = QtGui.QColor.fromRgbF(*COLORS[curve.color_index % len(COLORS)])
+                item.setForeground(color)
+                self.reference_curve_list.addItem(item)
+
+            if not chain.reference_curves:
+                self.reference_curve_label_edit.clear()
+                self.reference_curve_metric_combo.setCurrentIndex(0)
+                self.reference_curve_visible_check.setChecked(False)
+                self.reference_curve_mode_combo.setCurrentIndex(0)
+                self.reference_curve_baseline_spin.setValue(0.0)
+                self.reference_curve_editor.set_metric("bend")
+                self.reference_curve_editor.set_curve_points(_default_reference_points("bend"))
+                self.reference_peak_editor.set_profile("bend", _default_reference_peaks("bend"), 0.0)
+                self._set_reference_curve_controls_enabled(True, False)
+                self._sync_reference_curve_preview(chain, None)
+                self.reference_curve_status.setText("新規で参照曲線を作成できます。")
+                return
+
+            if select_index is None:
+                select_index = current_row
+            select_index = max(0, min(int(select_index), len(chain.reference_curves) - 1))
+            self.reference_curve_list.setCurrentRow(select_index)
+            curve = chain.reference_curves[select_index]
+            metric = _reference_metric_name(curve.metric)
+            metric_index = self.reference_curve_metric_combo.findData(metric)
+            mode = _reference_profile_mode(curve.profile_mode)
+            mode_index = self.reference_curve_mode_combo.findData(mode)
+            self.reference_curve_label_edit.setText(curve.label)
+            self.reference_curve_metric_combo.setCurrentIndex(metric_index if metric_index >= 0 else 0)
+            self.reference_curve_visible_check.setChecked(bool(curve.visible))
+            self.reference_curve_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+            self._set_reference_baseline_range(metric)
+            self.reference_curve_baseline_spin.setValue(float(curve.baseline))
+            self.reference_curve_editor.set_metric(metric)
+            self.reference_curve_editor.set_curve_points(curve.normalized_points())
+            peaks = curve.normalized_peaks() or _default_reference_peaks(metric)
+            self.reference_peak_editor.set_profile(metric, peaks, curve.baseline)
+            self._set_reference_curve_controls_enabled(True, True)
+            self._sync_reference_curve_preview(chain, curve)
+            self.reference_curve_status.setText("参照曲線: %s / %s" % (chain.label, curve.label))
+        finally:
+            self._syncing_reference_curve_controls = False
+
+    def on_reference_curve_selected(self, row):
+        if self._syncing_reference_curve_controls:
+            return
+        self._sync_reference_curve_controls(select_index=row)
+
+    def on_reference_curve_metric_changed(self, *_args):
+        if self._syncing_reference_curve_controls:
+            return
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        metric = _reference_metric_name(self.reference_curve_metric_combo.itemData(self.reference_curve_metric_combo.currentIndex()))
+        curve = chain.reference_curves[index]
+        curve.metric = metric
+        if metric == "bend":
+            curve.baseline = max(0.0, curve.baseline)
+            curve.points = [(x, max(0.0, y)) for x, y in curve.normalized_points()]
+            curve.peaks = curve.normalized_peaks()
+        if curve.profile_mode == "peaks" and not curve.peaks:
+            curve.peaks = _default_reference_peaks(metric)
+        self._syncing_reference_curve_controls = True
+        try:
+            self._set_reference_baseline_range(metric)
+            self.reference_curve_baseline_spin.setValue(curve.baseline)
+            self.reference_curve_editor.set_metric(metric)
+            self.reference_curve_editor.set_curve_points(curve.normalized_points())
+            self.reference_peak_editor.set_profile(metric, curve.normalized_peaks() or _default_reference_peaks(metric), curve.baseline)
+        finally:
+            self._syncing_reference_curve_controls = False
+        self.save_scene_data()
+        self._sync_reference_curve_outputs(chain, curve)
+        self._sync_reference_curve_controls(select_index=index)
+
+    def on_reference_curve_mode_changed(self, *_args):
+        if self._syncing_reference_curve_controls:
+            return
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves[index]
+        mode = self._current_reference_curve_mode()
+        curve.profile_mode = mode
+        if mode == "peaks" and not curve.peaks:
+            curve.peaks = _default_reference_peaks(curve.metric)
+        self.reference_peak_editor.set_profile(curve.metric, curve.normalized_peaks() or _default_reference_peaks(curve.metric), curve.baseline)
+        self._sync_reference_curve_mode_ui(has_curve=True)
+        self.save_scene_data()
+        self._sync_reference_curve_outputs(chain, curve)
+        self._sync_reference_curve_controls(select_index=index)
+
+    def on_reference_curve_baseline_changed(self, value):
+        if self._syncing_reference_curve_controls:
+            return
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves[index]
+        curve.profile_mode = "peaks"
+        curve.baseline = max(0.0, float(value)) if _reference_metric_name(curve.metric) == "bend" else float(value)
+        self.reference_peak_editor.set_profile(curve.metric, curve.normalized_peaks() or _default_reference_peaks(curve.metric), curve.baseline)
+        self.save_scene_data()
+        self._sync_reference_curve_outputs(chain, curve)
+
+    def on_reference_curve_visible_changed(self, checked):
+        if self._syncing_reference_curve_controls:
+            return
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves[index]
+        curve.visible = bool(checked)
+        self.save_scene_data()
+        self._sync_reference_curve_outputs(chain, curve)
+        self._sync_reference_curve_controls(select_index=index)
+
+    def on_reference_curve_points_changed(self, points):
+        if self._syncing_reference_curve_controls:
+            return
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves[index]
+        curve.profile_mode = "bezier"
+        curve.points = [(float(x), float(y)) for x, y in points]
+        self._sync_reference_curve_outputs(chain, curve)
+
+    def on_reference_curve_edit_finished(self, points):
+        self.on_reference_curve_points_changed(points)
+        index = self._selected_reference_curve_index()
+        if index >= 0:
+            self.save_scene_data()
+            self._sync_reference_curve_outputs()
+
+    def on_reference_curve_peaks_changed(self, peaks):
+        if self._syncing_reference_curve_controls:
+            return
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves[index]
+        curve.profile_mode = "peaks"
+        curve.peaks = [dict(peak) for peak in peaks]
+        curve.baseline = float(self.reference_curve_baseline_spin.value())
+        self._sync_reference_curve_outputs(chain, curve)
+
+    def on_reference_curve_peak_edit_finished(self, peaks):
+        self.on_reference_curve_peaks_changed(peaks)
+        index = self._selected_reference_curve_index()
+        if index >= 0:
+            self.save_scene_data()
+            self._sync_reference_curve_outputs()
+
+    def add_reference_curve_peak(self):
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves[index]
+        curve.profile_mode = "peaks"
+        mode_index = self.reference_curve_mode_combo.findData("peaks")
+        if mode_index >= 0:
+            self.reference_curve_mode_combo.setCurrentIndex(mode_index)
+        if not curve.peaks:
+            self.reference_peak_editor.set_profile(curve.metric, _default_reference_peaks(curve.metric), curve.baseline)
+        self.reference_peak_editor.add_peak()
+        self._sync_reference_curve_outputs(chain, curve)
+        self.reference_curve_status.setText("山を追加しました: %s" % curve.label)
+
+    def delete_reference_curve_peak(self):
+        index = self._selected_reference_curve_index()
+        chain = self._selected_chain()
+        if chain is None or index < 0:
+            return
+        if self.reference_peak_editor.delete_selected_peak():
+            self._sync_reference_curve_outputs(chain, chain.reference_curves[index])
+            self.reference_curve_status.setText("選択中の山を削除しました。")
+        else:
+            self.reference_curve_status.setText("削除する山を選択してください。")
+
+    def create_reference_curve(self):
+        chain = self._selected_chain()
+        if chain is None:
+            return
+        metric = _reference_metric_name(self.reference_curve_metric_combo.itemData(self.reference_curve_metric_combo.currentIndex()))
+        mode = self._current_reference_curve_mode()
+        base = "ねじれカーブ" if metric == "twist" else "曲がりカーブ"
+        curve = ReferenceCurveData(
+            label=self._unique_reference_curve_label(chain, base),
+            metric=metric,
+            points=_default_reference_points(metric),
+            profile_mode=mode,
+            peaks=_default_reference_peaks(metric) if mode == "peaks" else [],
+            baseline=0.0,
+            color_index=len(chain.reference_curves) % len(COLORS),
+        )
+        chain.reference_curves.append(curve)
+        self.save_scene_data()
+        self._sync_reference_curve_outputs(chain, curve)
+        self._sync_reference_curve_controls(select_index=len(chain.reference_curves) - 1)
+        self.reference_curve_status.setText("参照曲線を作成しました: %s" % curve.label)
+
+    def save_reference_curve(self):
+        chain = self._selected_chain()
+        index = self._selected_reference_curve_index()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves[index]
+        curve.label = self._unique_reference_curve_label(chain, self.reference_curve_label_edit.text(), exclude_index=index)
+        curve.metric = _reference_metric_name(self.reference_curve_metric_combo.itemData(self.reference_curve_metric_combo.currentIndex()))
+        curve.visible = bool(self.reference_curve_visible_check.isChecked())
+        curve.profile_mode = self._current_reference_curve_mode()
+        curve.baseline = float(self.reference_curve_baseline_spin.value())
+        if curve.profile_mode == "peaks":
+            curve.peaks = self.reference_peak_editor.curve_peaks()
+        else:
+            curve.points = self.reference_curve_editor.curve_points()
+        self.save_scene_data()
+        self._sync_reference_curve_outputs(chain, curve)
+        self._sync_reference_curve_controls(select_index=index)
+        self.reference_curve_status.setText("参照曲線を保存しました: %s" % curve.label)
+
+    def duplicate_reference_curve(self):
+        chain = self._selected_chain()
+        index = self._selected_reference_curve_index()
+        if chain is None or index < 0:
+            return
+        source = chain.reference_curves[index]
+        curve = ReferenceCurveData(
+            label=self._unique_reference_curve_label(chain, source.label + "_copy"),
+            metric=source.metric,
+            points=source.normalized_points(),
+            profile_mode=source.profile_mode,
+            peaks=source.normalized_peaks(),
+            baseline=source.baseline,
+            visible=source.visible,
+            color_index=len(chain.reference_curves) % len(COLORS),
+        )
+        chain.reference_curves.append(curve)
+        self.save_scene_data()
+        self._sync_reference_curve_outputs(chain, curve)
+        self._sync_reference_curve_controls(select_index=len(chain.reference_curves) - 1)
+        self.reference_curve_status.setText("参照曲線を複製しました: %s" % curve.label)
+
+    def delete_reference_curve(self):
+        chain = self._selected_chain()
+        index = self._selected_reference_curve_index()
+        if chain is None or index < 0:
+            return
+        curve = chain.reference_curves.pop(index)
+        self.save_scene_data()
+        next_curve = chain.reference_curves[max(0, index - 1)] if chain.reference_curves else None
+        self._sync_reference_curve_outputs(chain, next_curve)
+        self._sync_reference_curve_controls(select_index=max(0, index - 1))
+        self.reference_curve_status.setText("参照曲線を削除しました: %s" % curve.label)
 
     def _selected_chain_index(self):
         item = self.chain_list.currentItem()
@@ -1345,6 +2604,8 @@ class TailCodeTATool(QtWidgets.QDialog):
     def on_chain_selected(self, current=None, previous=None):
         chain = self._selected_chain()
         if chain is None:
+            self._sync_reference_graphs(None)
+            self._sync_reference_curve_controls()
             return
         self.label_edit.setText(chain.label)
         # Keep the joint search/input field under user control when browsing chains.
@@ -1355,6 +2616,7 @@ class TailCodeTATool(QtWidgets.QDialog):
             self.threshold_spin.blockSignals(False)
         self.refresh_details(chain)
         self._sync_twist_axis_combo()
+        self._sync_reference_curve_controls()
 
     def refresh_all(self):
         self.chain_list.blockSignals(True)
@@ -1393,6 +2655,8 @@ class TailCodeTATool(QtWidgets.QDialog):
         if self.chains:
             index = max(0, min(current, len(self.chains) - 1))
             self.chain_list.setCurrentItem(self.chain_list.topLevelItem(index))
+        else:
+            self._sync_reference_curve_controls()
         self.update_scores_and_display()
 
     def _visibility_changed(self, item, column=0):
@@ -1473,6 +2737,27 @@ class TailCodeTATool(QtWidgets.QDialog):
         self._fill_angle_table(result["angle_rows"], chain.threshold)
         self.angle_graph.set_angle_rows(result["angle_rows"], chain.threshold)
         self.twist_graph.set_angle_rows(result["angle_rows"], chain.threshold)
+        self._sync_reference_graphs(chain)
+
+    def _reference_curves_for_metric(self, chain, metric):
+        metric = _reference_metric_name(metric)
+        if chain is None:
+            return []
+        return [
+            curve
+            for curve in chain.reference_curves
+            if curve.visible and _reference_metric_name(curve.metric) == metric
+        ]
+
+    def _sync_reference_graphs(self, chain=None, sync_preview=True):
+        if chain is None:
+            chain = self._selected_chain()
+        if not hasattr(self, "angle_graph"):
+            return
+        self.angle_graph.set_reference_curves(self._reference_curves_for_metric(chain, "bend"))
+        self.twist_graph.set_reference_curves(self._reference_curves_for_metric(chain, "twist"))
+        if sync_preview:
+            self._sync_reference_curve_preview(chain)
 
     def _graph_for_metric(self, metric):
         return self.twist_graph if metric == "twist" else self.angle_graph
@@ -1821,6 +3106,8 @@ class TailCodeTATool(QtWidgets.QDialog):
             self._update_display_curve(chain, result["positions"])
         if selected:
             self.refresh_details(selected)
+        else:
+            self._sync_reference_graphs(None)
 
     def _display_curve_name(self, chain):
         return "tailCodeTATool_%s_CRV" % _safe_name(chain.label)
